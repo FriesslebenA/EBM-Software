@@ -1,0 +1,4572 @@
+import argparse
+import json
+import math
+import multiprocessing as mp
+import os
+import queue
+import random
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+from array import array
+from collections import defaultdict
+from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from statistics import mean, pstdev
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+Point = Tuple[float, float]
+Stats = Dict[str, float]
+ProgressCallback = Optional[Callable[[float, str], None]]
+
+W1_DEFAULT = 1.0
+W2_DEFAULT = 0.5
+MEMORY_DEFAULT = 4
+GRID_SPREAD_DEFAULT_SPACING = 0.1
+GRID_SPREAD_DEFAULT_RECENT_PERCENT = 10.0
+GRID_SPREAD_AGE_DECAY_DEFAULT = 0.9
+APP_DISPLAY_NAME = "Sequence optimiser"
+APP_BUILD_NAME = "SequenceOptimiser"
+VIEWER_PAYLOAD_PREFIX = "sequence_viewer_payload_"
+VIEWER_POINTS_PER_SECOND_BASE = 3.0
+VIEWER_POINTS_PER_SECOND_MAX = 3000.0
+VIEWER_TIMER_INTERVAL_MS = 33
+MODE_PARAMETER_MEMORY = "memory"
+MODE_PARAMETER_GRID_SPACING = "grid_spacing"
+MODE_PARAMETER_RECENT_PERCENT = "recent_percent"
+ANIMATION_BASE_POINTS_PER_SECOND = 3.0
+ANIMATION_MIN_MULTIPLIER = 1
+ANIMATION_MAX_MULTIPLIER = 1000
+ANIMATION_MAX_FPS = 30.0
+TRAIL_MIN_POINTS = 1
+TRAIL_MAX_POINTS = 64
+TRAIL_DEFAULT_POINTS = 4
+MAX_RENDER_GRADIENT_BINS = 48
+BACKGROUND_POINT_HALF_SIZE = 1
+VISITED_POINT_HALF_SIZE = 2
+HEAD_POINT_RADIUS = 5
+ZIP_ENTRY_NAME_PATTERN = re.compile(r"^(\d+)0(\d)1$", re.IGNORECASE)
+ZIP_ENTRY_TYPES = ("infill", "boundary", "combo")
+ZIP_ENTRY_TYPE_LABELS = {
+    "infill": "Infill",
+    "boundary": "Boundary",
+    "combo": "Kombi",
+}
+
+
+@dataclass(frozen=True)
+class ModeSpec:
+    canonical_id: str
+    label: str
+    description: str
+    visible_parameters: Tuple[str, ...]
+
+
+MODE_SPECS: Dict[str, ModeSpec] = {
+    "local_greedy": ModeSpec(
+        canonical_id="local_greedy",
+        label="Local Greedy Optimisation",
+        description=(
+            "This mode minimises the immediate travel distance while retaining a short-term memory of recently "
+            "visited locations. The repulsive memory term discourages immediate revisits to nearby regions, "
+            "which yields a locally efficient yet still spatially stabilised traversal."
+        ),
+        visible_parameters=(MODE_PARAMETER_MEMORY,),
+    ),
+    "dispersion_maximisation": ModeSpec(
+        canonical_id="dispersion_maximisation",
+        label="Dispersion Maximisation",
+        description=(
+            "This mode emphasises spatial separation from the recent visitation history and therefore promotes "
+            "global dispersion before local consolidation. It is suited to scan orders where broad area coverage "
+            "is more important than the shortest immediate jump."
+        ),
+        visible_parameters=(MODE_PARAMETER_MEMORY,),
+    ),
+    "deterministic_grid_dispersion": ModeSpec(
+        canonical_id="deterministic_grid_dispersion",
+        label="Deterministic Grid Dispersion",
+        description=(
+            "This mode projects points onto a virtual lattice and traverses occupied grid buckets in a deterministic, "
+            "spatially balanced order. Within each bucket, candidates are selected to maximise distance from the "
+            "recently visited subset, producing reproducible large-scale dispersion."
+        ),
+        visible_parameters=(MODE_PARAMETER_GRID_SPACING, MODE_PARAMETER_RECENT_PERCENT),
+    ),
+    "stochastic_grid_dispersion": ModeSpec(
+        canonical_id="stochastic_grid_dispersion",
+        label="Stochastic Grid Dispersion",
+        description=(
+            "This mode uses the same virtual lattice as the deterministic variant but injects controlled stochasticity "
+            "when sampling candidates inside each bucket. The result preserves macroscopic dispersion while reducing "
+            "systematic ordering artefacts on densely populated grid cells."
+        ),
+        visible_parameters=(MODE_PARAMETER_GRID_SPACING, MODE_PARAMETER_RECENT_PERCENT),
+    ),
+    "density_adaptive_sampling": ModeSpec(
+        canonical_id="density_adaptive_sampling",
+        label="Density-Adaptive Sampling",
+        description=(
+            "This mode performs a density-aware stochastic traversal that penalises locally crowded regions and "
+            "prioritises under-sampled spatial zones. It is intended for sequences where adaptive coverage and "
+            "reduced clustering are scientifically preferable to strict deterministic repeatability."
+        ),
+        visible_parameters=(),
+    ),
+}
+MODE_ALIASES = {
+    "greedy": "local_greedy",
+    "basic": "local_greedy",
+    "spread": "dispersion_maximisation",
+    "grid_spread": "deterministic_grid_dispersion",
+    "random_grid": "stochastic_grid_dispersion",
+    "random_noise": "density_adaptive_sampling",
+}
+OPTIMIZATION_MODES = tuple(MODE_SPECS)
+
+
+@dataclass
+class ProcessedFileResult:
+    source_path: Path
+    source_label: str
+    archive_member: Optional[str]
+    output_name: str
+    original_lines: List[str]
+    original_points: List[Point]
+    optimized_points: List[Point]
+    original_stats: Stats
+    optimized_stats: Stats
+    output_text: str
+    processing_seconds: float
+
+
+@dataclass
+class AnimationPlan:
+    progress_values: array
+    frame_count: int
+    fps: float
+    points_per_second: float
+    speed_multiplier: int
+
+
+@dataclass
+class GridPreviewData:
+    source_path: Path
+    source_label: str
+    archive_member: Optional[str]
+    point_count: int
+    sampled_points: List[Point]
+    bounds: Tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class InputSource:
+    source_kind: str
+    source_path: str
+    source_label: str
+    output_name: str
+    archive_member: Optional[str] = None
+
+
+class CancelledWorkError(RuntimeError):
+    """Raised when a background calculation was cancelled by the user."""
+
+
+def raise_if_cancelled(cancel_event: object = None) -> None:
+    """Abort cooperative worker tasks when the shared cancel flag is set."""
+    if cancel_event is not None and bool(cancel_event.is_set()):
+        raise CancelledWorkError("Vorgang wurde abgebrochen.")
+
+
+def is_cancelled_exception(exc: BaseException) -> bool:
+    """Detect user-triggered cooperative cancellation exceptions."""
+    return isinstance(exc, CancelledWorkError) or "abgebrochen" in str(exc).lower()
+
+
+def _parse_abs_line(line: str) -> Optional[Point]:
+    """Parse one ABS line and return the point, otherwise None."""
+    stripped = line.strip()
+    if not stripped.startswith("ABS"):
+        return None
+
+    parts = stripped.split()
+    if len(parts) < 3 or parts[0] != "ABS":
+        raise ValueError(f"Ungueltige ABS-Zeile: {line!r}")
+
+    try:
+        x = float(parts[1])
+        y = float(parts[2])
+    except ValueError as exc:
+        raise ValueError(f"ABS-Zeile enthaelt keine gueltigen Floats: {line!r}") from exc
+
+    return (x, y)
+
+
+def _parse_points_from_lines(raw_lines: Sequence[str], source_label: str) -> Tuple[List[str], List[Point]]:
+    """Parse ABS points from already loaded text lines."""
+    original_lines: List[str] = []
+    points: List[Point] = []
+
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        line = raw_line.rstrip("\r\n")
+        original_lines.append(line)
+
+        try:
+            point = _parse_abs_line(line)
+        except ValueError as exc:
+            raise ValueError(f"Fehler in Zeile {line_number}: {exc}") from exc
+
+        if point is not None:
+            points.append(point)
+
+    if not points:
+        raise ValueError(f"Keine ABS-Zeilen gefunden in: {source_label}")
+
+    return original_lines, points
+
+
+def _decode_text_bytes(raw_bytes: bytes) -> str:
+    """Decode text bytes from files or ZIP entries with a small fallback chain."""
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def load_points_from_file(file_path: str) -> Tuple[List[str], List[Point]]:
+    """Read one file and return all original lines plus parsed ABS points."""
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Eingabedatei nicht gefunden: {file_path}")
+
+    with open(file_path, "r", encoding="utf-8") as handle:
+        return _parse_points_from_lines(handle.readlines(), file_path)
+
+
+def load_points_from_zip_entry(zip_path: str, archive_member: str) -> Tuple[List[str], List[Point]]:
+    """Read one B99-like text entry from a ZIP archive."""
+    if not os.path.isfile(zip_path):
+        raise FileNotFoundError(f"ZIP-Datei nicht gefunden: {zip_path}")
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            raw_bytes = archive.read(archive_member)
+    except KeyError as exc:
+        raise FileNotFoundError(f"ZIP-Eintrag nicht gefunden: {archive_member}") from exc
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Ungueltige ZIP-Datei: {zip_path}") from exc
+
+    text = _decode_text_bytes(raw_bytes)
+    return _parse_points_from_lines(text.splitlines(), f"{zip_path}!{archive_member}")
+
+
+def get_mode_spec(mode: str) -> ModeSpec:
+    """Return the canonical mode specification for a user or legacy mode value."""
+    normalized_mode = MODE_ALIASES.get(mode, mode)
+    spec = MODE_SPECS.get(normalized_mode)
+    if spec is None:
+        raise ValueError(f"Unbekannter Optimierungsmodus: {mode!r}")
+    return spec
+
+
+def get_mode_label(mode: str) -> str:
+    """Return the scientific user-facing label for one optimization mode."""
+    return get_mode_spec(mode).label
+
+
+def _build_plain_output_name(file_name: str, mode: str) -> str:
+    """Build one optimised output filename from a plain file name."""
+    spec = get_mode_spec(mode)
+    name_path = Path(file_name)
+    stem = name_path.stem if name_path.stem else "sequence"
+    return f"{stem}_optimised_{spec.canonical_id}{name_path.suffix}"
+
+
+def build_output_name_for_source(input_source: "InputSource", mode: str) -> str:
+    """Build the output member/file name while preserving ZIP parent folders."""
+    if input_source.archive_member:
+        member_path = PurePosixPath(input_source.archive_member)
+        renamed_member = _build_plain_output_name(member_path.name, mode)
+        if str(member_path.parent) == ".":
+            return renamed_member
+        return str(member_path.parent / renamed_member)
+    return _build_plain_output_name(input_source.output_name, mode)
+
+
+def build_default_zip_name(results: Sequence["ProcessedFileResult"], mode: str) -> str:
+    """Suggest a ZIP name based on one or many processed outputs."""
+    spec = get_mode_spec(mode)
+    if len(results) == 1:
+        output_path = PurePosixPath(results[0].output_name.replace("\\", "/"))
+        base_stem = Path(output_path.name).stem or "sequence"
+        return f"{base_stem}.zip"
+    return f"sequence_optimised_{spec.canonical_id}.zip"
+
+
+def normalize_input_source(source: Union[str, InputSource]) -> InputSource:
+    """Normalize plain file paths and prepared input sources into InputSource objects."""
+    if isinstance(source, InputSource):
+        return source
+
+    source_path = str(source)
+    path_obj = Path(source_path)
+    suffix = path_obj.suffix or ".txt"
+    return InputSource(
+        source_kind="file",
+        source_path=source_path,
+        source_label=path_obj.name,
+        output_name=path_obj.name if path_obj.name else f"optimized{suffix}",
+        archive_member=None,
+    )
+
+
+def _classify_b99_type(type_digit: int) -> str:
+    """Classify the type digit from a B99 filename."""
+    if type_digit == 9:
+        return "combo"
+    if type_digit % 2 == 0:
+        return "infill"
+    return "boundary"
+
+
+def parse_b99_archive_entry_name(entry_name: str) -> Optional[Tuple[int, str]]:
+    """Extract layer and type classification from one ZIP entry name."""
+    entry_path = Path(entry_name)
+    if entry_path.suffix.lower() != ".b99":
+        return None
+
+    match = ZIP_ENTRY_NAME_PATTERN.fullmatch(entry_path.stem)
+    if match is None:
+        return None
+
+    layer_value = int(match.group(1))
+    type_digit = int(match.group(2))
+    return (layer_value, _classify_b99_type(type_digit))
+
+
+def build_input_sources(
+    selected_paths: Sequence[str],
+    zip_entry_type: str = "infill",
+    zip_support_end_layer: int = 0,
+) -> Tuple[List[InputSource], List[str]]:
+    """Resolve selected files and ZIP archives into concrete processable input sources."""
+    resolved_sources: List[InputSource] = []
+    errors: List[str] = []
+
+    for selected_path in selected_paths:
+        path_obj = Path(selected_path)
+        if path_obj.suffix.lower() != ".zip":
+            resolved_sources.append(normalize_input_source(selected_path))
+            continue
+
+        try:
+            with zipfile.ZipFile(selected_path, "r") as archive:
+                matching_entries: List[Tuple[str, int, str]] = []
+                for archive_member in archive.namelist():
+                    parsed = parse_b99_archive_entry_name(archive_member)
+                    if parsed is None:
+                        continue
+                    layer_value, entry_type = parsed
+                    if layer_value <= zip_support_end_layer:
+                        continue
+                    if entry_type != zip_entry_type:
+                        continue
+                    matching_entries.append((archive_member, layer_value, entry_type))
+        except zipfile.BadZipFile as exc:
+            errors.append(f"{selected_path}: Ungueltige ZIP-Datei ({exc})")
+            continue
+        except Exception as exc:
+            errors.append(f"{selected_path}: {exc}")
+            continue
+
+        if not matching_entries:
+            errors.append(
+                f"{selected_path}: Keine passenden .B99-Eintraege fuer Typ "
+                f"'{ZIP_ENTRY_TYPE_LABELS.get(zip_entry_type, zip_entry_type)}' oberhalb Schicht {zip_support_end_layer} gefunden."
+            )
+            continue
+
+        matching_entries.sort(key=lambda item: (item[1], item[0].lower()))
+        for archive_member, _, _ in matching_entries:
+            resolved_sources.append(
+                InputSource(
+                    source_kind="zip_entry",
+                    source_path=str(path_obj),
+                    source_label=f"{path_obj.name} :: {archive_member}",
+                    output_name=archive_member,
+                    archive_member=archive_member,
+                )
+            )
+
+    return resolved_sources, errors
+
+
+def load_points_from_input_source(source: Union[str, InputSource]) -> Tuple[List[str], List[Point]]:
+    """Load points from a normal file or from one selected ZIP entry."""
+    input_source = normalize_input_source(source)
+    if input_source.source_kind == "zip_entry":
+        assert input_source.archive_member is not None
+        return load_points_from_zip_entry(input_source.source_path, input_source.archive_member)
+    return load_points_from_file(input_source.source_path)
+
+
+def dist(a: Point, b: Point) -> float:
+    """Return the Euclidean distance between two points."""
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def normalize_mode(mode: str) -> str:
+    """Normalize user-facing and legacy optimization mode names."""
+    return get_mode_spec(mode).canonical_id
+
+
+def _cell_key(point: Point, min_x: float, min_y: float, cell_size: float) -> Tuple[int, int]:
+    """Map a point to a grid cell for fast neighborhood lookup."""
+    return (
+        int(math.floor((point[0] - min_x) / cell_size)),
+        int(math.floor((point[1] - min_y) / cell_size)),
+    )
+
+
+def _score_candidate(candidate: Point, current: Point, recent_points: List[Point], w1: float, w2: float) -> float:
+    """Calculate the basic greedy score for one candidate point."""
+    score = w1 * dist(candidate, current)
+    if recent_points:
+        score -= w2 * sum(dist(candidate, recent) for recent in recent_points)
+    return score
+
+
+def _spread_score_candidate(candidate: Point, current: Point, recent_points: List[Point], w1: float, w2: float) -> float:
+    """Calculate the spread score for one candidate point."""
+    score = w1 * dist(candidate, current)
+    if recent_points:
+        score += w2 * sum(dist(candidate, recent) for recent in recent_points)
+    return score
+
+
+def _weighted_recent_score(candidate: Point, recent_ids: List[int], points: List[Point], age_decay: float) -> float:
+    """Score one candidate by its weighted distance to the newest recent points."""
+    score = 0.0
+    for age, point_id in enumerate(reversed(recent_ids)):
+        score += (age_decay ** age) * dist(candidate, points[point_id])
+    return score
+
+
+def _grid_bucket_key(point: Point, min_x: float, min_y: float, grid_spacing: float) -> Tuple[int, int]:
+    """Map a point to the nearest virtual grid intersection."""
+    return (
+        int(round((point[0] - min_x) / grid_spacing)),
+        int(round((point[1] - min_y) / grid_spacing)),
+    )
+
+
+def _grid_bucket_target(
+    bucket_key: Tuple[int, int],
+    min_x: float,
+    min_y: float,
+    grid_spacing: float,
+) -> Point:
+    """Return the virtual grid-intersection point for one grid bucket."""
+    grid_x, grid_y = bucket_key
+    return (
+        min_x + grid_x * grid_spacing,
+        min_y + grid_y * grid_spacing,
+    )
+
+
+def _build_grid_bucket_order(bucket_keys: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Return a snake-like traversal order over occupied grid buckets."""
+    row_map: Dict[int, List[int]] = defaultdict(list)
+    for grid_x, grid_y in bucket_keys:
+        row_map[grid_y].append(grid_x)
+
+    ordered_keys: List[Tuple[int, int]] = []
+    for row_index, grid_y in enumerate(sorted(row_map)):
+        xs = sorted(row_map[grid_y])
+        if row_index % 2 == 1:
+            xs.reverse()
+        ordered_keys.extend((grid_x, grid_y) for grid_x in xs)
+
+    return ordered_keys
+
+
+def choose_next_bucket(
+    grid_buckets: Dict[Tuple[int, int], List[int]],
+    bucket_last_used_step: Dict[Tuple[int, int], int],
+    bucket_order_index: Dict[Tuple[int, int], int],
+    current_point: Optional[Point],
+    current_step: int,
+    min_x: float,
+    min_y: float,
+    grid_spacing: float,
+) -> Tuple[int, int]:
+    """Choose the next grid bucket while keeping the traversal spatially spread out."""
+    if not grid_buckets:
+        raise ValueError("Es gibt keine Grid-Buckets mehr zur Auswahl.")
+
+    def bucket_score(bucket_key: Tuple[int, int]) -> Tuple[int, int, int, float, int]:
+        remaining_count = len(grid_buckets[bucket_key])
+        last_used_step = bucket_last_used_step.get(bucket_key)
+        never_used = 1 if last_used_step is None else 0
+        age_since_use = current_step + 1 if last_used_step is None else current_step - last_used_step
+        bucket_target = _grid_bucket_target(bucket_key, min_x, min_y, grid_spacing)
+        distance_score = 0.0 if current_point is None else dist(current_point, bucket_target)
+        # Earlier snake-order buckets win the final tie to keep the traversal deterministic.
+        order_score = -bucket_order_index.get(bucket_key, 0)
+        return (never_used, age_since_use, remaining_count, distance_score, order_score)
+
+    return max(grid_buckets, key=bucket_score)
+
+
+def select_bucket_candidates(
+    bucket_ids: Sequence[int],
+    candidate_limit: int,
+    randomized: bool = False,
+    rng: Optional[random.Random] = None,
+) -> List[int]:
+    """Return either the first N or a random N candidates from one bucket."""
+    safe_limit = max(1, min(len(bucket_ids), candidate_limit))
+    if safe_limit >= len(bucket_ids):
+        return list(bucket_ids)
+    if randomized:
+        random_source = rng if rng is not None else random
+        return list(random_source.sample(list(bucket_ids), safe_limit))
+    return list(bucket_ids[:safe_limit])
+
+
+def sample_points_for_preview(points: Sequence[Point], max_points: int = 5000) -> List[Point]:
+    """Return a bounded point sample for fast static preview rendering."""
+    if len(points) <= max_points:
+        return list(points)
+
+    step = max(1, len(points) // max_points)
+    sampled = list(points[::step])
+    if sampled[-1] != points[-1]:
+        sampled.append(points[-1])
+    return sampled[: max_points + 1]
+
+
+def compute_point_bounds(points: Sequence[Point]) -> Tuple[float, float, float, float]:
+    """Return min/max bounds for an arbitrary point list."""
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def map_point_to_bounds(
+    point: Point,
+    bounds: Tuple[float, float, float, float],
+    width: int,
+    height: int,
+    margin: int = 28,
+) -> Tuple[float, float]:
+    """Map one point into a canvas rectangle while keeping aspect ratio."""
+    min_x, max_x, min_y, max_y = bounds
+    span_x = max(max_x - min_x, 1e-12)
+    span_y = max(max_y - min_y, 1e-12)
+
+    scale = min((width - margin * 2) / span_x, (height - margin * 2) / span_y)
+    content_width = span_x * scale
+    content_height = span_y * scale
+    offset_x = (width - content_width) / 2
+    offset_y = (height - content_height) / 2
+
+    x_pos = offset_x + (point[0] - min_x) * scale
+    y_pos = height - (offset_y + (point[1] - min_y) * scale)
+    return (x_pos, y_pos)
+
+
+def build_grid_preview_data(
+    input_sources: Sequence[Union[str, InputSource]],
+    max_points_per_file: int = 5000,
+) -> Tuple[List[GridPreviewData], List[str]]:
+    """Load a light-weight preview representation for the selected files or ZIP entries."""
+    preview_items: List[GridPreviewData] = []
+    errors: List[str] = []
+
+    for source in input_sources:
+        input_source = normalize_input_source(source)
+        try:
+            _, points = load_points_from_input_source(input_source)
+        except Exception as exc:
+            errors.append(f"{input_source.source_label}: {exc}")
+            continue
+
+        preview_items.append(
+            GridPreviewData(
+                source_path=Path(input_source.source_path),
+                source_label=input_source.source_label,
+                archive_member=input_source.archive_member,
+                point_count=len(points),
+                sampled_points=sample_points_for_preview(points, max_points=max_points_per_file),
+                bounds=compute_point_bounds(points),
+            )
+        )
+
+    return preview_items, errors
+
+
+def _collect_candidate_ids(
+    current: Point,
+    points: List[Point],
+    active_ids: Set[int],
+    cell_points: Dict[Tuple[int, int], Set[int]],
+    min_x: float,
+    min_y: float,
+    cell_size: float,
+    target_candidates: int,
+) -> List[int]:
+    """Collect a bounded candidate set near the current point."""
+    if not active_ids:
+        return []
+
+    current_cell_x, current_cell_y = _cell_key(current, min_x, min_y, cell_size)
+    candidate_ids: List[int] = []
+    seen_ids: Set[int] = set()
+    radius = 0
+    max_radius = 10
+
+    while radius <= max_radius and len(candidate_ids) < target_candidates:
+        for cell_x in range(current_cell_x - radius, current_cell_x + radius + 1):
+            for cell_y in range(current_cell_y - radius, current_cell_y + radius + 1):
+                if radius > 0:
+                    is_border = (
+                        cell_x == current_cell_x - radius
+                        or cell_x == current_cell_x + radius
+                        or cell_y == current_cell_y - radius
+                        or cell_y == current_cell_y + radius
+                    )
+                    if not is_border:
+                        continue
+
+                for point_id in cell_points.get((cell_x, cell_y), ()):
+                    if point_id in active_ids and point_id not in seen_ids:
+                        candidate_ids.append(point_id)
+                        seen_ids.add(point_id)
+        radius += 1
+
+    if len(candidate_ids) < min(target_candidates, len(active_ids)):
+        # Fallback: broaden the search with a bounded sample from the remaining points.
+        sample_limit = max(target_candidates * 4, 256)
+        for point_id in active_ids:
+            if point_id not in seen_ids:
+                candidate_ids.append(point_id)
+                seen_ids.add(point_id)
+            if len(candidate_ids) >= sample_limit:
+                break
+
+    if not candidate_ids:
+        return [next(iter(active_ids))]
+
+    candidate_ids.sort(key=lambda point_id: dist(points[point_id], current))
+    return candidate_ids[: max(target_candidates, 1)]
+
+
+def _collect_farthest_candidate_ids(
+    current: Point,
+    points: List[Point],
+    active_ids: Set[int],
+    target_candidates: int,
+) -> List[int]:
+    """Collect a set of far-away candidates from the remaining points."""
+    if len(active_ids) <= target_candidates:
+        return list(active_ids)
+
+    return sorted(
+        active_ids,
+        key=lambda point_id: (-dist(points[point_id], current), point_id),
+    )[:target_candidates]
+
+
+def _cell_center(cell_key: Tuple[int, int], min_x: float, min_y: float, cell_size: float) -> Point:
+    """Return the center point of one spatial lookup cell."""
+    return (
+        min_x + (cell_key[0] + 0.5) * cell_size,
+        min_y + (cell_key[1] + 0.5) * cell_size,
+    )
+
+
+def _neighbor_density(cell_key: Tuple[int, int], cell_points: Dict[Tuple[int, int], Set[int]]) -> int:
+    """Estimate local density by summing active points in the surrounding 3x3 cells."""
+    cell_x, cell_y = cell_key
+    density = 0
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            density += len(cell_points.get((cell_x + dx, cell_y + dy), ()))
+    return density
+
+
+def _approx_distance_to_visited_cells(
+    cell_key: Tuple[int, int],
+    visited_cell_keys: Set[Tuple[int, int]],
+    min_x: float,
+    min_y: float,
+    cell_size: float,
+    rng: random.Random,
+) -> float:
+    """Approximate spacing to the visited area using nearby occupied visited cells."""
+    if not visited_cell_keys:
+        return cell_size * 2.0
+
+    target_center = _cell_center(cell_key, min_x, min_y, cell_size)
+    cell_x, cell_y = cell_key
+    best_distance = float("inf")
+    max_radius = 6
+
+    for radius in range(max_radius + 1):
+        found_in_radius = False
+        for search_x in range(cell_x - radius, cell_x + radius + 1):
+            for search_y in range(cell_y - radius, cell_y + radius + 1):
+                if radius > 0:
+                    is_border = (
+                        search_x == cell_x - radius
+                        or search_x == cell_x + radius
+                        or search_y == cell_y - radius
+                        or search_y == cell_y + radius
+                    )
+                    if not is_border:
+                        continue
+
+                search_key = (search_x, search_y)
+                if search_key not in visited_cell_keys:
+                    continue
+                found_in_radius = True
+                best_distance = min(
+                    best_distance,
+                    dist(target_center, _cell_center(search_key, min_x, min_y, cell_size)),
+                )
+
+        if found_in_radius and best_distance <= (radius + 1.5) * cell_size:
+            return best_distance
+
+    if len(visited_cell_keys) <= 128:
+        sampled_keys = list(visited_cell_keys)
+    else:
+        sampled_keys = rng.sample(list(visited_cell_keys), 128)
+
+    for search_key in sampled_keys:
+        best_distance = min(
+            best_distance,
+            dist(target_center, _cell_center(search_key, min_x, min_y, cell_size)),
+        )
+
+    return best_distance
+
+
+def _weighted_random_choice(
+    candidate_ids: Sequence[object],
+    weights: Sequence[float],
+    rng: random.Random,
+) -> object:
+    """Pick one candidate by positive weights with a stable fallback."""
+    if not candidate_ids:
+        raise ValueError("Es wurden keine Kandidaten fuer die Zufallsauswahl uebergeben.")
+
+    safe_weights = [max(0.0, float(weight)) for weight in weights]
+    total_weight = sum(safe_weights)
+    if total_weight <= 0.0:
+        return candidate_ids[rng.randrange(len(candidate_ids))]
+
+    threshold = rng.random() * total_weight
+    running_weight = 0.0
+    for candidate_id, weight in zip(candidate_ids, safe_weights):
+        running_weight += weight
+        if running_weight >= threshold:
+            return candidate_id
+
+    return candidate_ids[-1]
+
+
+def optimize_path(
+    points: List[Point],
+    w1: float = W1_DEFAULT,
+    w2: float = W2_DEFAULT,
+    memory: int = MEMORY_DEFAULT,
+    mode: str = "local_greedy",
+    progress_callback: ProgressCallback = None,
+    grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
+    recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
+    age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    cancel_event: object = None,
+) -> List[Point]:
+    """Optimize point order with the selected strategy."""
+    if not points:
+        return []
+
+    normalized_mode = normalize_mode(mode)
+
+    if memory < 0:
+        raise ValueError("memory darf nicht negativ sein.")
+
+    if grid_spacing <= 0.0:
+        raise ValueError("grid_spacing muss groesser als 0 sein.")
+
+    if not 0.0 < recent_percent <= 100.0:
+        raise ValueError("recent_percent muss zwischen 0 und 100 liegen.")
+
+    if not 0.0 < age_decay <= 1.0:
+        raise ValueError("age_decay muss zwischen 0 und 1 liegen.")
+
+    if len(points) == 1:
+        if progress_callback is not None:
+            progress_callback(1.0, "1 / 1 Punkte optimiert")
+        return points.copy()
+
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
+    span_x = max(max_x - min_x, 1e-12)
+    span_y = max(max_y - min_y, 1e-12)
+
+    density_scale = math.sqrt((span_x * span_y) / max(len(points), 1))
+    cell_size = max(density_scale, max(span_x, span_y) / max(64.0, math.sqrt(len(points))), 1e-9)
+
+    cell_points: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+    for point_id, point in enumerate(points):
+        cell_points[_cell_key(point, min_x, min_y, cell_size)].add(point_id)
+
+    active_ids: Set[int] = set(range(len(points)))
+    active_cell_keys: Set[Tuple[int, int]] = {cell_key for cell_key, ids in cell_points.items() if ids}
+    optimized_ids: List[int] = []
+    total_steps = len(points)
+    report_every = max(1, total_steps // 200)
+
+    def report_progress(detail: str) -> None:
+        if progress_callback is None:
+            return
+        finished_steps = len(optimized_ids)
+        if finished_steps == 0:
+            return
+        if finished_steps == total_steps or finished_steps % report_every == 0:
+            progress_callback(finished_steps / total_steps, detail)
+
+    def register_point(point_id: int) -> None:
+        optimized_ids.append(point_id)
+        active_ids.remove(point_id)
+        point_cell_key = _cell_key(points[point_id], min_x, min_y, cell_size)
+        cell_points[point_cell_key].discard(point_id)
+        if not cell_points[point_cell_key]:
+            active_cell_keys.discard(point_cell_key)
+
+    if normalized_mode in {"deterministic_grid_dispersion", "stochastic_grid_dispersion"}:
+        grid_buckets: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        for point_id, point in enumerate(points):
+            bucket_key = _grid_bucket_key(point, min_x, min_y, grid_spacing)
+            grid_buckets[bucket_key].append(point_id)
+
+        for bucket_key, bucket_ids in grid_buckets.items():
+            target_point = _grid_bucket_target(bucket_key, min_x, min_y, grid_spacing)
+            bucket_ids.sort(key=lambda point_id: (dist(points[point_id], target_point), point_id))
+
+        bucket_order = _build_grid_bucket_order(tuple(grid_buckets))
+        bucket_order_index = {bucket_key: index for index, bucket_key in enumerate(bucket_order)}
+        bucket_last_used_step: Dict[Tuple[int, int], int] = {}
+
+        while active_ids and grid_buckets:
+            raise_if_cancelled(cancel_event)
+            current_point = points[optimized_ids[-1]] if optimized_ids else None
+            bucket_key = choose_next_bucket(
+                grid_buckets=grid_buckets,
+                bucket_last_used_step=bucket_last_used_step,
+                bucket_order_index=bucket_order_index,
+                current_point=current_point,
+                current_step=len(optimized_ids),
+                min_x=min_x,
+                min_y=min_y,
+                grid_spacing=grid_spacing,
+            )
+
+            bucket_ids = grid_buckets[bucket_key]
+            if not bucket_ids:
+                del grid_buckets[bucket_key]
+                continue
+
+            recent_count = max(1, int(len(optimized_ids) * (recent_percent / 100.0)))
+            recent_ids = optimized_ids[-recent_count:] if optimized_ids else []
+            target_point = _grid_bucket_target(bucket_key, min_x, min_y, grid_spacing)
+            candidate_limit = min(len(bucket_ids), 64)
+            candidate_ids = select_bucket_candidates(
+                bucket_ids,
+                candidate_limit=candidate_limit,
+                randomized=(normalized_mode == "stochastic_grid_dispersion"),
+            )
+
+            if recent_ids:
+                best_id = max(
+                    candidate_ids,
+                    key=lambda point_id: (
+                        _weighted_recent_score(points[point_id], recent_ids, points, age_decay),
+                        -dist(points[point_id], target_point),
+                        -point_id,
+                    ),
+                )
+            else:
+                best_id = min(
+                    candidate_ids,
+                    key=lambda point_id: (dist(points[point_id], target_point), point_id),
+                )
+
+            register_point(best_id)
+            bucket_ids.remove(best_id)
+            bucket_last_used_step[bucket_key] = len(optimized_ids) - 1
+            if not bucket_ids:
+                del grid_buckets[bucket_key]
+            report_progress(
+                f"{len(optimized_ids)} / {total_steps} Punkte mit "
+                f"{get_mode_label(normalized_mode)} optimiert"
+            )
+
+        return [points[point_id] for point_id in optimized_ids]
+
+    if normalized_mode == "density_adaptive_sampling":
+        rng = random.Random()
+        visited_cell_keys: Set[Tuple[int, int]] = set()
+        start_id = rng.randrange(len(points))
+        register_point(start_id)
+        visited_cell_keys.add(_cell_key(points[start_id], min_x, min_y, cell_size))
+        report_progress(f"{len(optimized_ids)} / {total_steps} Punkte mit {get_mode_label(normalized_mode)} optimiert")
+
+        while active_ids:
+            raise_if_cancelled(cancel_event)
+            candidate_cell_pool = list(active_cell_keys)
+            if len(candidate_cell_pool) > 128:
+                candidate_cell_pool = rng.sample(candidate_cell_pool, 128)
+
+            cell_weights: List[float] = []
+            for candidate_cell_key in candidate_cell_pool:
+                local_density = _neighbor_density(candidate_cell_key, cell_points)
+                spacing_score = _approx_distance_to_visited_cells(
+                    candidate_cell_key,
+                    visited_cell_keys,
+                    min_x,
+                    min_y,
+                    cell_size,
+                    rng,
+                )
+                # Dense regions are penalized, distant regions get higher probability.
+                cell_weight = ((spacing_score + cell_size * 0.35) ** 2) / (1.0 + math.sqrt(max(local_density, 1)))
+                cell_weights.append(cell_weight)
+
+            chosen_cell_key = candidate_cell_pool[0]
+            if candidate_cell_pool:
+                chosen_cell_key = _weighted_random_choice(candidate_cell_pool, cell_weights, rng)
+
+            bucket_ids = list(cell_points.get(chosen_cell_key, ()))
+            if not bucket_ids:
+                active_cell_keys.discard(chosen_cell_key)
+                continue
+
+            candidate_ids = select_bucket_candidates(
+                bucket_ids,
+                candidate_limit=min(len(bucket_ids), 64),
+                randomized=True,
+                rng=rng,
+            )
+            local_density = _neighbor_density(chosen_cell_key, cell_points)
+            point_weights = []
+            for point_id in candidate_ids:
+                point_cell_key = _cell_key(points[point_id], min_x, min_y, cell_size)
+                spacing_score = _approx_distance_to_visited_cells(
+                    point_cell_key,
+                    visited_cell_keys,
+                    min_x,
+                    min_y,
+                    cell_size,
+                    rng,
+                )
+                point_weight = ((spacing_score + cell_size * 0.15) ** 2) / (1.0 + max(local_density - 1, 0) * 0.35)
+                point_weights.append(point_weight)
+
+            best_id = _weighted_random_choice(candidate_ids, point_weights, rng)
+            register_point(best_id)
+            visited_cell_keys.add(_cell_key(points[best_id], min_x, min_y, cell_size))
+            report_progress(
+                f"{len(optimized_ids)} / {total_steps} Punkte mit {get_mode_label(normalized_mode)} optimiert"
+            )
+
+        return [points[point_id] for point_id in optimized_ids]
+
+    register_point(0)
+    report_progress(f"{len(optimized_ids)} / {total_steps} Punkte optimiert")
+
+    while active_ids:
+        raise_if_cancelled(cancel_event)
+        current_id = optimized_ids[-1]
+        current = points[current_id]
+        recent_points = [points[point_id] for point_id in optimized_ids[-memory:]] if memory > 0 else []
+        target_candidates = min(max(96, memory * 24), len(active_ids))
+
+        if normalized_mode == "local_greedy":
+            candidate_ids = _collect_candidate_ids(
+                current=current,
+                points=points,
+                active_ids=active_ids,
+                cell_points=cell_points,
+                min_x=min_x,
+                min_y=min_y,
+                cell_size=cell_size,
+                target_candidates=target_candidates,
+            )
+            best_id = min(
+                candidate_ids,
+                key=lambda point_id: _score_candidate(points[point_id], current, recent_points, w1, w2),
+            )
+        else:
+            candidate_ids = _collect_farthest_candidate_ids(
+                current=current,
+                points=points,
+                active_ids=active_ids,
+                target_candidates=target_candidates,
+            )
+            best_id = max(
+                candidate_ids,
+                key=lambda point_id: _spread_score_candidate(points[point_id], current, recent_points, w1, w2),
+            )
+
+        register_point(best_id)
+        report_progress(f"{len(optimized_ids)} / {total_steps} Punkte optimiert")
+
+    return [points[point_id] for point_id in optimized_ids]
+
+
+def analyze_path(points: List[Point]) -> Stats:
+    """Calculate jump statistics for a point order."""
+    if len(points) < 2:
+        return {
+            "mean_jump": 0.0,
+            "max_jump": 0.0,
+            "min_jump": 0.0,
+            "std_jump": 0.0,
+            "count_jumps": 0.0,
+        }
+
+    jumps = [dist(points[index], points[index + 1]) for index in range(len(points) - 1)]
+
+    return {
+        "mean_jump": mean(jumps),
+        "max_jump": max(jumps),
+        "min_jump": min(jumps),
+        "std_jump": pstdev(jumps),
+        "count_jumps": float(len(jumps)),
+    }
+
+
+def print_points_as_abs(points: List[Point]) -> List[str]:
+    """Format points as ABS lines without changing any coordinate values."""
+    return [f"ABS {x:.17g} {y:.17g}" for x, y in points]
+
+
+def build_output_lines(original_lines: List[str], optimized_points: List[Point]) -> List[str]:
+    """Return all output lines while only replacing the order of ABS lines."""
+    abs_lines = print_points_as_abs(optimized_points)
+    abs_index = 0
+    output_lines: List[str] = []
+
+    for line in original_lines:
+        if _parse_abs_line(line) is not None:
+            if abs_index >= len(abs_lines):
+                raise ValueError("Zu wenige optimierte ABS-Zeilen fuer den Export.")
+            output_lines.append(abs_lines[abs_index])
+            abs_index += 1
+        else:
+            output_lines.append(line)
+
+    if abs_index != len(abs_lines):
+        raise ValueError("Zu viele optimierte ABS-Zeilen fuer den Export.")
+
+    return output_lines
+
+
+def build_output_text(original_lines: List[str], optimized_points: List[Point]) -> str:
+    """Build the optimized file content as one text block."""
+    return "\n".join(build_output_lines(original_lines, optimized_points)) + "\n"
+
+
+def save_points(original_lines: List[str], optimized_points: List[Point], output_path: str) -> None:
+    """Save one optimized text file to disk."""
+    output_text = build_output_text(original_lines, optimized_points)
+    with open(output_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(output_text)
+
+
+def process_file(
+    source: Union[str, InputSource],
+    w1: float,
+    w2: float,
+    memory: int,
+    mode: str,
+    progress_callback: ProgressCallback = None,
+    grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
+    recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
+    age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    cancel_event: object = None,
+) -> ProcessedFileResult:
+    """Load, optimize and analyze one ABS file."""
+    input_source = normalize_input_source(source)
+    started_at = time.perf_counter()
+    raise_if_cancelled(cancel_event)
+
+    if progress_callback is not None:
+        progress_callback(0.02, "Datei wird eingelesen")
+
+    original_lines, original_points = load_points_from_input_source(input_source)
+    raise_if_cancelled(cancel_event)
+
+    if progress_callback is not None:
+        progress_callback(0.08, f"{len(original_points)} ABS-Punkte geladen")
+
+    source_points = list(original_points)
+    optimized_points = optimize_path(
+        list(source_points),
+        w1=w1,
+        w2=w2,
+        memory=memory,
+        mode=mode,
+        progress_callback=(
+            None
+            if progress_callback is None
+            else lambda fraction, detail: progress_callback(0.08 + 0.84 * fraction, detail)
+        ),
+        grid_spacing=grid_spacing,
+        recent_percent=recent_percent,
+        age_decay=age_decay,
+        cancel_event=cancel_event,
+    )
+    raise_if_cancelled(cancel_event)
+
+    if progress_callback is not None:
+        progress_callback(0.95, "Analysiere Reihenfolgen")
+
+    original_stats = analyze_path(original_points)
+    optimized_stats = analyze_path(optimized_points)
+    raise_if_cancelled(cancel_event)
+
+    output_text = build_output_text(original_lines, optimized_points)
+
+    return ProcessedFileResult(
+        source_path=Path(input_source.source_path),
+        source_label=input_source.source_label,
+        archive_member=input_source.archive_member,
+        output_name=build_output_name_for_source(input_source, mode),
+        original_lines=original_lines,
+        original_points=source_points,
+        optimized_points=optimized_points,
+        original_stats=original_stats,
+        optimized_stats=optimized_stats,
+        output_text=output_text,
+        processing_seconds=time.perf_counter() - started_at,
+    )
+
+
+def process_files(
+    input_sources: Sequence[Union[str, InputSource]],
+    w1: float,
+    w2: float,
+    memory: int,
+    mode: str,
+    grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
+    recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
+    age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+) -> Tuple[List[ProcessedFileResult], List[str]]:
+    """Process all selected files and collect readable errors."""
+    results: List[ProcessedFileResult] = []
+    errors: List[str] = []
+
+    for input_source in input_sources:
+        try:
+            result = process_file(
+                input_source,
+                w1=w1,
+                w2=w2,
+                memory=memory,
+                mode=mode,
+                grid_spacing=grid_spacing,
+                recent_percent=recent_percent,
+                age_decay=age_decay,
+            )
+        except Exception as exc:
+            source_label = normalize_input_source(input_source).source_label
+            errors.append(f"{source_label}: {exc}")
+            continue
+
+        results.append(result)
+        print_analysis_for_file(result)
+
+    return results, errors
+
+
+def _clone_zip_info(zip_info: zipfile.ZipInfo, filename: Optional[str] = None) -> zipfile.ZipInfo:
+    """Create a writable copy of a ZipInfo entry while preserving metadata."""
+    cloned = zipfile.ZipInfo(filename or zip_info.filename, date_time=zip_info.date_time)
+    cloned.compress_type = zip_info.compress_type
+    cloned.comment = zip_info.comment
+    cloned.extra = zip_info.extra
+    cloned.create_system = zip_info.create_system
+    cloned.create_version = zip_info.create_version
+    cloned.extract_version = zip_info.extract_version
+    cloned.flag_bits = zip_info.flag_bits
+    cloned.volume = zip_info.volume
+    cloned.internal_attr = zip_info.internal_attr
+    cloned.external_attr = zip_info.external_attr
+    return cloned
+
+
+def save_results_as_zip(results: Sequence[ProcessedFileResult], zip_path: str) -> None:
+    """Write all optimized files into one ZIP archive."""
+    if not results:
+        raise ValueError("Es gibt keine optimierten Dateien zum Speichern.")
+
+    results_by_archive: Dict[Path, Dict[str, ProcessedFileResult]] = defaultdict(dict)
+    plain_results: List[ProcessedFileResult] = []
+    used_output_names: Set[str] = set()
+
+    for result in results:
+        if result.archive_member is not None:
+            existing = results_by_archive[result.source_path].get(result.archive_member)
+            if existing is not None:
+                raise ValueError(f"Doppelter ZIP-Eintrag im Export: {result.archive_member}")
+            results_by_archive[result.source_path][result.archive_member] = result
+        else:
+            plain_results.append(result)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for source_zip_path, replacement_map in results_by_archive.items():
+            with zipfile.ZipFile(source_zip_path, "r") as source_archive:
+                for zip_info in source_archive.infolist():
+                    replacement = replacement_map.get(zip_info.filename)
+                    target_name = replacement.output_name if replacement is not None else zip_info.filename
+                    if target_name in used_output_names:
+                        raise ValueError(
+                            f"Namenskonflikt beim ZIP-Export: {target_name} kommt in mehreren Quellen vor."
+                        )
+
+                    cloned_info = _clone_zip_info(zip_info, filename=target_name)
+                    if zip_info.is_dir():
+                        archive.writestr(cloned_info, b"")
+                    elif replacement is not None:
+                        archive.writestr(cloned_info, replacement.output_text.encode("utf-8"))
+                    else:
+                        archive.writestr(cloned_info, source_archive.read(zip_info.filename))
+                    used_output_names.add(target_name)
+
+        for result in plain_results:
+            target_name = result.output_name
+            if target_name in used_output_names:
+                raise ValueError(
+                    f"Namenskonflikt beim ZIP-Export: {target_name} existiert bereits im Ausgabearchiv."
+                )
+            archive.writestr(target_name, result.output_text.encode("utf-8"))
+            used_output_names.add(target_name)
+
+
+def format_stats(stats: Stats) -> str:
+    """Format jump statistics for console output and the GUI."""
+    return (
+        f"mean_jump : {stats['mean_jump']:.6f}\n"
+        f"max_jump  : {stats['max_jump']:.6f}\n"
+        f"min_jump  : {stats['min_jump']:.6f}\n"
+        f"std_jump  : {stats['std_jump']:.6f}\n"
+        f"count_jumps: {int(stats['count_jumps'])}"
+    )
+
+
+def format_duration(seconds: float, include_tenths: bool = False) -> str:
+    """Format a duration in a compact readable form."""
+    safe_seconds = max(0.0, float(seconds))
+    if include_tenths:
+        total_tenths = int(round(safe_seconds * 10))
+        hours, rem = divmod(total_tenths, 36000)
+        minutes, rem = divmod(rem, 600)
+        whole_seconds, tenths = divmod(rem, 10)
+        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{tenths}"
+
+    total_seconds = int(round(safe_seconds))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, whole_seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}"
+
+
+def print_analysis_for_file(result: ProcessedFileResult) -> None:
+    """Print one file summary to the console."""
+    print(f"\nDatei: {result.source_label}")
+    print(f"Berechnungszeit: {format_duration(result.processing_seconds, include_tenths=True)}")
+    print("Originale Reihenfolge")
+    print("---------------------")
+    print(format_stats(result.original_stats))
+    print()
+    print("Optimierte Reihenfolge")
+    print("----------------------")
+    print(format_stats(result.optimized_stats))
+
+
+def ask_for_input_files(parent: tk.Misc) -> Tuple[str, ...]:
+    """Open the Windows file picker for one or more supported input files."""
+    parent.update_idletasks()
+    return filedialog.askopenfilenames(
+        parent=parent,
+        title="ABS-Dateien auswaehlen",
+        filetypes=(
+            ("Unterstuetzte Dateien", "*.txt *.b99 *.zip"),
+            ("Textdateien", "*.txt"),
+            ("B99-Dateien", "*.b99"),
+            ("ZIP-Dateien", "*.zip"),
+            ("Alle Dateien", "*.*"),
+        ),
+    )
+
+
+def ask_for_zip_path(parent: tk.Misc, initial_name: str) -> str:
+    """Open the Windows save dialog for the ZIP archive."""
+    return filedialog.asksaveasfilename(
+        parent=parent,
+        title="ZIP-Datei speichern",
+        defaultextension=".zip",
+        filetypes=(("ZIP-Dateien", "*.zip"),),
+        initialfile=initial_name,
+    )
+
+
+def ask_for_zip_import_settings(
+    parent: tk.Misc,
+    current_entry_type: str,
+    current_support_end_layer: int,
+) -> Optional[Dict[str, object]]:
+    """Ask which B99 type should be imported from ZIP files and where support ends."""
+    dialog = tk.Toplevel(parent)
+    dialog.title("ZIP-Import")
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+    dialog.configure(bg="#1a1a1a")
+
+    result = {"value": None}
+    entry_type_var = tk.StringVar(value=current_entry_type)
+    support_end_var = tk.StringVar(value=str(current_support_end_layer))
+    help_var = tk.StringVar(
+        value=(
+            "ZIP-Dateien werden nach .B99-Dateien durchsucht. "
+            "Waehlen Sie die Art und bis zu welcher Schicht die Stuetstruktur ignoriert werden soll."
+        )
+    )
+
+    frame = tk.Frame(dialog, bg="#1a1a1a", padx=18, pady=16)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text="ZIP-Import fuer .B99-Eintraege",
+        bg="#1a1a1a",
+        fg="#f0f0f0",
+        font=("Segoe UI", 10, "bold"),
+        justify="left",
+    ).pack(anchor="w")
+
+    form = tk.Frame(frame, bg="#1a1a1a")
+    form.pack(fill="x", pady=(14, 10))
+
+    tk.Label(form, text="Art", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=0,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    entry_type_box = ttk.Combobox(
+        form,
+        textvariable=entry_type_var,
+        values=ZIP_ENTRY_TYPES,
+        state="readonly",
+        width=16,
+    )
+    entry_type_box.grid(row=0, column=1, sticky="w", pady=4)
+
+    tk.Label(form, text="Stuetzstruktur bis Schicht", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=1,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    support_spin = tk.Spinbox(
+        form,
+        from_=0,
+        to=999999,
+        textvariable=support_end_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+    support_spin.grid(row=1, column=1, sticky="w", pady=4)
+
+    tk.Label(
+        frame,
+        textvariable=help_var,
+        bg="#1a1a1a",
+        fg="#d0d0d0",
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=460,
+    ).pack(anchor="w", pady=(0, 14))
+
+    button_row = tk.Frame(frame, bg="#1a1a1a")
+    button_row.pack(fill="x")
+
+    def confirm() -> None:
+        selected_type = entry_type_var.get()
+        if selected_type not in ZIP_ENTRY_TYPES:
+            messagebox.showerror("ZIP-Import", "Bitte eine gueltige Art auswaehlen.", parent=dialog)
+            return
+
+        try:
+            support_end_layer = int(support_end_var.get())
+        except ValueError:
+            messagebox.showerror("ZIP-Import", "Bitte eine ganze Zahl fuer die Schicht eingeben.", parent=dialog)
+            return
+
+        if support_end_layer < 0:
+            messagebox.showerror("ZIP-Import", "Die Schicht darf nicht negativ sein.", parent=dialog)
+            return
+
+        result["value"] = {
+            "entry_type": selected_type,
+            "support_end_layer": support_end_layer,
+        }
+        dialog.destroy()
+
+    ttk.Button(button_row, text="Weiter", command=confirm).pack(side="left")
+    ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(side="left", padx=(10, 0))
+
+    center_toplevel(parent, dialog)
+    entry_type_box.focus_set()
+    dialog.wait_window()
+    return result["value"]
+
+
+def ask_for_optimization_settings(
+    parent: tk.Misc,
+    current_mode: str,
+    current_memory: int,
+    current_grid_spacing: float,
+    current_recent_percent: float,
+) -> Optional[Dict[str, object]]:
+    """Ask for the optimization mode and its mode-specific parameters."""
+    dialog = tk.Toplevel(parent)
+    dialog.title(f"{APP_DISPLAY_NAME} - Modusauswahl")
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+    dialog.configure(bg="#1a1a1a")
+
+    result = {"value": None}
+    mode_var = tk.StringVar(value=get_mode_label(current_mode))
+    memory_var = tk.StringVar(value=str(current_memory))
+    grid_spacing_var = tk.StringVar(value=f"{current_grid_spacing:.6g}")
+    recent_percent_var = tk.StringVar(value=f"{current_recent_percent:.6g}")
+    help_var = tk.StringVar()
+    parameter_hint_var = tk.StringVar()
+    mode_labels = [MODE_SPECS[mode_id].label for mode_id in OPTIMIZATION_MODES]
+    label_to_mode = {spec.label: spec.canonical_id for spec in MODE_SPECS.values()}
+
+    frame = tk.Frame(dialog, bg="#1a1a1a", padx=18, pady=16)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text="Waehlen Sie den Optimierungsmodus und die dazugehoerigen wissenschaftlichen Parameter.",
+        bg="#1a1a1a",
+        fg="#f0f0f0",
+        font=("Segoe UI", 10, "bold"),
+        justify="left",
+        wraplength=460,
+    ).pack(anchor="w")
+
+    form = tk.Frame(frame, bg="#1a1a1a")
+    form.pack(fill="x", pady=(14, 10))
+
+    tk.Label(form, text="Modus", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=0,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    mode_box = ttk.Combobox(form, textvariable=mode_var, values=mode_labels, state="readonly", width=34)
+    mode_box.grid(row=0, column=1, sticky="we", pady=4)
+
+    memory_label = tk.Label(form, text="Memory", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    memory_spin = tk.Spinbox(form, from_=0, to=9999, textvariable=memory_var, width=12, font=("Segoe UI", 10))
+
+    grid_spacing_label = tk.Label(form, text="Grid spacing", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    grid_spacing_entry = tk.Entry(form, textvariable=grid_spacing_var, width=14, font=("Segoe UI", 10))
+
+    recent_percent_label = tk.Label(form, text="Recent set (%)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    recent_percent_spin = tk.Spinbox(
+        form,
+        from_=1,
+        to=100,
+        increment=1,
+        textvariable=recent_percent_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+
+    age_decay_label = tk.Label(
+        form,
+        text=f"Age decay (fixed): {GRID_SPREAD_AGE_DECAY_DEFAULT:.2f}",
+        bg="#1a1a1a",
+        fg="#cfcfcf",
+        font=("Segoe UI", 10),
+        justify="left",
+    )
+    parameter_hint_label = tk.Label(
+        form,
+        textvariable=parameter_hint_var,
+        bg="#1a1a1a",
+        fg="#cfcfcf",
+        font=("Segoe UI", 9, "italic"),
+        justify="left",
+        wraplength=460,
+    )
+
+    memory_label.grid(
+        row=1,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    memory_spin.grid(row=1, column=1, sticky="w", pady=4)
+
+    grid_spacing_label.grid(
+        row=2,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    grid_spacing_entry.grid(row=2, column=1, sticky="w", pady=4)
+
+    recent_percent_label.grid(
+        row=3,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    recent_percent_spin.grid(row=3, column=1, sticky="w", pady=4)
+
+    age_decay_label.grid(
+        row=4,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        pady=(8, 0),
+    )
+    parameter_hint_label.grid(
+        row=5,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        pady=(10, 0),
+    )
+    form.grid_columnconfigure(1, weight=1)
+
+    tk.Label(
+        frame,
+        textvariable=help_var,
+        bg="#1a1a1a",
+        fg="#d0d0d0",
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=460,
+    ).pack(anchor="w", pady=(0, 14))
+
+    button_row = tk.Frame(frame, bg="#1a1a1a")
+    button_row.pack(fill="x")
+
+    def update_mode_fields(*_args: object) -> None:
+        selected_mode = label_to_mode.get(mode_var.get(), normalize_mode(current_mode))
+        spec = get_mode_spec(selected_mode)
+        visible_parameters = set(spec.visible_parameters)
+
+        for widget in (memory_label, memory_spin):
+            if MODE_PARAMETER_MEMORY in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        for widget in (grid_spacing_label, grid_spacing_entry):
+            if MODE_PARAMETER_GRID_SPACING in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        for widget in (recent_percent_label, recent_percent_spin):
+            if MODE_PARAMETER_RECENT_PERCENT in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        if MODE_PARAMETER_GRID_SPACING in visible_parameters:
+            age_decay_label.grid()
+        else:
+            age_decay_label.grid_remove()
+
+        if visible_parameters:
+            parameter_hint_var.set("")
+            parameter_hint_label.grid_remove()
+        else:
+            parameter_hint_var.set("Dieser Modus benoetigt keine zusaetzlichen Eingabeparameter.")
+            parameter_hint_label.grid()
+
+        help_var.set(spec.description)
+
+    def confirm() -> None:
+        try:
+            selected_mode = label_to_mode[mode_var.get()]
+        except ValueError:
+            messagebox.showerror("Pfadberechnung", "Bitte einen gueltigen Modus auswaehlen.", parent=dialog)
+            return
+        except KeyError:
+            messagebox.showerror("Pfadberechnung", "Bitte einen gueltigen Modus auswaehlen.", parent=dialog)
+            return
+
+        spec = get_mode_spec(selected_mode)
+        visible_parameters = set(spec.visible_parameters)
+
+        memory_value = current_memory
+        if MODE_PARAMETER_MEMORY in visible_parameters:
+            try:
+                memory_value = int(memory_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte fuer Memory eine ganze Zahl eingeben.", parent=dialog)
+                return
+
+        if MODE_PARAMETER_MEMORY in visible_parameters and memory_value < 0:
+            messagebox.showerror("Pfadberechnung", "Memory darf nicht negativ sein.", parent=dialog)
+            return
+
+        grid_spacing = current_grid_spacing
+        recent_percent = current_recent_percent
+
+        if MODE_PARAMETER_GRID_SPACING in visible_parameters:
+            try:
+                grid_spacing = float(grid_spacing_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte einen gueltigen Gitterabstand eingeben.", parent=dialog)
+                return
+
+            try:
+                recent_percent = float(recent_percent_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte einen gueltigen Prozentwert eingeben.", parent=dialog)
+                return
+
+            if grid_spacing <= 0.0:
+                messagebox.showerror("Pfadberechnung", "Der Gitterabstand muss groesser als 0 sein.", parent=dialog)
+                return
+
+            if not 0.0 < recent_percent <= 100.0:
+                messagebox.showerror("Pfadberechnung", "Der Prozentwert muss zwischen 0 und 100 liegen.", parent=dialog)
+                return
+
+        result["value"] = {
+            "mode": spec.canonical_id,
+            "memory": memory_value,
+            "grid_spacing": grid_spacing,
+            "recent_percent": recent_percent,
+            "age_decay": GRID_SPREAD_AGE_DECAY_DEFAULT,
+        }
+        dialog.destroy()
+
+    ttk.Button(button_row, text="Weiter", command=confirm).pack(side="left")
+    ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(side="left", padx=(10, 0))
+
+    mode_box.bind("<<ComboboxSelected>>", lambda _event: update_mode_fields())
+    update_mode_fields()
+    center_toplevel(parent, dialog)
+    mode_box.focus_set()
+    dialog.wait_window()
+    return result["value"]
+
+
+def ask_for_grid_spread_preview(
+    parent: tk.Misc,
+    preview_items: Sequence[GridPreviewData],
+    current_grid_spacing: float,
+) -> Optional[float]:
+    """Show a modal grid preview dialog before starting a grid-dispersion mode."""
+    if not preview_items:
+        messagebox.showerror(
+            "Grid-Vorschau",
+            "Es konnten keine gueltigen ABS-Punkte fuer die Gittervorschau geladen werden.",
+            parent=parent,
+        )
+        return None
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("Grid-Dispersion Vorschau")
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(True, True)
+    dialog.configure(bg="#161616")
+    dialog.minsize(820, 760)
+
+    result = {"value": None}
+    selected_name_var = tk.StringVar(value=preview_items[0].source_label)
+    spacing_var = tk.StringVar(value=f"{current_grid_spacing:.6g}")
+    spacing_slider_var = tk.DoubleVar(value=500.0)
+    slider_hint_var = tk.StringVar()
+    info_var = tk.StringVar()
+    redraw_job: Dict[str, Optional[str]] = {"id": None}
+    slider_state = {"min": 0.0, "max": 1.0, "syncing": False}
+
+    frame = tk.Frame(dialog, bg="#161616", padx=16, pady=16)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text=(
+            "Pruefen Sie vor dem Rechnen die Gittergroesse auf der groben Form. "
+            "Sie koennen den Gitterabstand hier noch anpassen."
+        ),
+        bg="#161616",
+        fg="#f0f0f0",
+        font=("Segoe UI", 10, "bold"),
+        justify="left",
+        wraplength=760,
+    ).pack(anchor="w")
+
+    controls = tk.Frame(frame, bg="#161616")
+    controls.pack(fill="x", pady=(12, 10))
+
+    tk.Label(controls, text="Datei", bg="#161616", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=0,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    file_box = ttk.Combobox(
+        controls,
+        textvariable=selected_name_var,
+        values=[item.source_label for item in preview_items],
+        state="readonly",
+        width=42,
+    )
+    file_box.grid(row=0, column=1, sticky="we", padx=(10, 14), pady=4)
+
+    tk.Label(controls, text="Gitterabstand", bg="#161616", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=0,
+        column=2,
+        sticky="w",
+        pady=4,
+    )
+    spacing_entry = tk.Entry(controls, textvariable=spacing_var, width=14, font=("Segoe UI", 10))
+    spacing_entry.grid(row=0, column=3, sticky="w", padx=(10, 10), pady=4)
+
+    preview_button = ttk.Button(controls, text="Vorschau aktualisieren")
+    preview_button.grid(row=0, column=4, sticky="w", pady=4)
+    controls.grid_columnconfigure(1, weight=1)
+
+    slider_row = tk.Frame(frame, bg="#161616")
+    slider_row.pack(fill="x", pady=(0, 10))
+
+    tk.Label(
+        slider_row,
+        text="Gittergroesse",
+        bg="#161616",
+        fg="#f0f0f0",
+        font=("Segoe UI", 10),
+    ).pack(side="left")
+
+    spacing_slider = tk.Scale(
+        slider_row,
+        from_=0,
+        to=1000,
+        orient="horizontal",
+        resolution=1,
+        showvalue=False,
+        variable=spacing_slider_var,
+        bg="#161616",
+        fg="#f0f0f0",
+        troughcolor="#2b2b2b",
+        highlightthickness=0,
+        length=360,
+    )
+    spacing_slider.pack(side="left", padx=(12, 12), fill="x", expand=True)
+
+    tk.Label(
+        slider_row,
+        textvariable=slider_hint_var,
+        bg="#161616",
+        fg="#d0d0d0",
+        font=("Segoe UI", 9),
+    ).pack(side="left")
+
+    canvas = tk.Canvas(
+        frame,
+        width=760,
+        height=560,
+        bg="#000000",
+        highlightthickness=1,
+        highlightbackground="#2a2a2a",
+    )
+    canvas.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        textvariable=info_var,
+        bg="#161616",
+        fg="#d7d7d7",
+        font=("Segoe UI", 10),
+        justify="left",
+        anchor="w",
+    ).pack(fill="x", pady=(10, 0))
+
+    button_row = tk.Frame(frame, bg="#161616")
+    button_row.pack(fill="x", pady=(14, 0))
+
+    def get_selected_item() -> GridPreviewData:
+        selected_name = selected_name_var.get()
+        for item in preview_items:
+            if item.source_label == selected_name:
+                return item
+        return preview_items[0]
+
+    def compute_spacing_limits(preview_item: GridPreviewData) -> Tuple[float, float]:
+        min_x, max_x, min_y, max_y = preview_item.bounds
+        span_x = max(max_x - min_x, 1e-12)
+        span_y = max(max_y - min_y, 1e-12)
+        span_max = max(span_x, span_y, 1e-9)
+        non_zero_spans = [span for span in (span_x, span_y) if span > 1e-9]
+        reference_span = min(non_zero_spans) if non_zero_spans else span_max
+        min_spacing = max(reference_span / 200.0, span_max / 1000.0, 1e-6)
+        max_spacing = max(span_max, min_spacing * 10.0)
+        return (min_spacing, max_spacing)
+
+    def slider_to_spacing(slider_value: float) -> float:
+        min_spacing = slider_state["min"]
+        max_spacing = slider_state["max"]
+        if max_spacing <= min_spacing * 1.0000001:
+            return min_spacing
+        ratio = max(0.0, min(1.0, slider_value / 1000.0))
+        return min_spacing * ((max_spacing / min_spacing) ** ratio)
+
+    def spacing_to_slider(spacing_value: float) -> float:
+        min_spacing = slider_state["min"]
+        max_spacing = slider_state["max"]
+        clamped_spacing = min(max(spacing_value, min_spacing), max_spacing)
+        if max_spacing <= min_spacing * 1.0000001:
+            return 0.0
+        return 1000.0 * math.log(clamped_spacing / min_spacing) / math.log(max_spacing / min_spacing)
+
+    def sync_slider_range_from_file(keep_spacing: Optional[float] = None) -> None:
+        preview_item = get_selected_item()
+        min_spacing, max_spacing = compute_spacing_limits(preview_item)
+        slider_state["min"] = min_spacing
+        slider_state["max"] = max_spacing
+        target_spacing = keep_spacing
+        if target_spacing is None:
+            try:
+                target_spacing = float(spacing_var.get())
+            except ValueError:
+                target_spacing = current_grid_spacing
+        target_spacing = min(max(float(target_spacing), min_spacing), max_spacing)
+        slider_state["syncing"] = True
+        spacing_slider_var.set(spacing_to_slider(target_spacing))
+        spacing_var.set(f"{target_spacing:.6g}")
+        slider_hint_var.set(f"ca. {min_spacing:.6g} bis {max_spacing:.6g}")
+        slider_state["syncing"] = False
+
+    def count_axis_positions(min_value: float, max_value: float, spacing_value: float) -> int:
+        if max_value <= min_value:
+            return 1
+        return max(1, int(math.floor((max_value - min_value) / spacing_value + 1e-9)) + 1)
+
+    def schedule_redraw(delay_ms: int = 100) -> None:
+        if redraw_job["id"] is not None:
+            dialog.after_cancel(redraw_job["id"])
+        redraw_job["id"] = dialog.after(delay_ms, redraw_preview)
+
+    def on_slider_changed(_value: str) -> None:
+        if slider_state["syncing"]:
+            return
+        spacing_value = slider_to_spacing(spacing_slider_var.get())
+        spacing_var.set(f"{spacing_value:.6g}")
+        schedule_redraw(90)
+
+    def sync_slider_from_entry() -> Optional[float]:
+        try:
+            spacing_value = float(spacing_var.get())
+        except ValueError:
+            return None
+
+        min_spacing = slider_state["min"]
+        max_spacing = slider_state["max"]
+        spacing_value = min(max(spacing_value, min_spacing), max_spacing)
+        slider_state["syncing"] = True
+        spacing_slider_var.set(spacing_to_slider(spacing_value))
+        spacing_var.set(f"{spacing_value:.6g}")
+        slider_state["syncing"] = False
+        return spacing_value
+
+    def redraw_preview(*_args: object) -> bool:
+        redraw_job["id"] = None
+        try:
+            spacing_value = float(spacing_var.get())
+        except ValueError:
+            info_var.set("Bitte einen gueltigen Gitterabstand eingeben.")
+            return False
+
+        if spacing_value <= 0.0:
+            info_var.set("Der Gitterabstand muss groesser als 0 sein.")
+            return False
+
+        preview_item = get_selected_item()
+        min_spacing, max_spacing = compute_spacing_limits(preview_item)
+        if spacing_value < min_spacing or spacing_value > max_spacing:
+            spacing_value = min(max(spacing_value, min_spacing), max_spacing)
+            spacing_var.set(f"{spacing_value:.6g}")
+        sync_slider_range_from_file(keep_spacing=spacing_value)
+        width = max(canvas.winfo_width(), int(canvas["width"]))
+        height = max(canvas.winfo_height(), int(canvas["height"]))
+        bounds = preview_item.bounds
+
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#000000", outline="")
+
+        for point in preview_item.sampled_points:
+            x_pos, y_pos = map_point_to_bounds(point, bounds, width, height)
+            canvas.create_rectangle(x_pos - 1, y_pos - 1, x_pos + 1, y_pos + 1, fill="#404040", outline="")
+
+        min_x, max_x, min_y, max_y = bounds
+        total_grid_x = count_axis_positions(min_x, max_x, spacing_value)
+        total_grid_y = count_axis_positions(min_y, max_y, spacing_value)
+
+        max_draw_lines = 120
+        x_stride = max(1, int(math.ceil(total_grid_x / max_draw_lines)))
+        y_stride = max(1, int(math.ceil(total_grid_y / max_draw_lines)))
+
+        for x_index in range(0, total_grid_x, x_stride):
+            x_value = min_x + x_index * spacing_value
+            line_x, _ = map_point_to_bounds((x_value, min_y), bounds, width, height)
+            canvas.create_line(line_x, 0, line_x, height, fill="#14465a")
+
+        for y_index in range(0, total_grid_y, y_stride):
+            y_value = min_y + y_index * spacing_value
+            _, line_y = map_point_to_bounds((min_x, y_value), bounds, width, height)
+            canvas.create_line(0, line_y, width, line_y, fill="#14465a")
+
+        canvas.create_rectangle(1, 1, width - 1, height - 1, outline="#2a2a2a")
+
+        stride_text = ""
+        if x_stride > 1 or y_stride > 1:
+            stride_text = f" | Vorschau vereinfacht: jede {x_stride}. vertikale / jede {y_stride}. horizontale Linie"
+
+        info_var.set(
+            f"{preview_item.source_label} | Punkte: {preview_item.point_count} | "
+            f"Vorschaupunkte: {len(preview_item.sampled_points)} | "
+            f"Gitter: {total_grid_x} x {total_grid_y} Linien{stride_text}"
+        )
+        return True
+
+    def confirm() -> None:
+        if not redraw_preview():
+            messagebox.showerror(
+                "Grid-Vorschau",
+                "Bitte korrigieren Sie zuerst den Gitterabstand.",
+                parent=dialog,
+            )
+            return
+
+        result["value"] = float(spacing_var.get())
+        dialog.destroy()
+
+    ttk.Button(button_row, text="Weiter", command=confirm).pack(side="left")
+    ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(side="left", padx=(10, 0))
+
+    preview_button.config(command=redraw_preview)
+    spacing_slider.config(command=on_slider_changed)
+    file_box.bind("<<ComboboxSelected>>", lambda _event: (sync_slider_range_from_file(), redraw_preview()))
+    spacing_entry.bind(
+        "<Return>",
+        lambda _event: (sync_slider_from_entry() is not None and redraw_preview()),
+    )
+    spacing_entry.bind(
+        "<FocusOut>",
+        lambda _event: (sync_slider_from_entry() is not None and redraw_preview()),
+    )
+    canvas.bind("<Configure>", redraw_preview)
+
+    sync_slider_range_from_file()
+    center_toplevel(parent, dialog)
+    dialog.after(20, redraw_preview)
+    spacing_entry.focus_set()
+    dialog.wait_window()
+    return result["value"]
+
+
+def show_fatal_error(message: str) -> None:
+    """Show a last-resort error message even if Tk cannot start correctly."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, message, APP_DISPLAY_NAME, 0x10)
+            return
+        except Exception:
+            pass
+
+    print(message, file=sys.stderr)
+
+
+def center_toplevel(parent: tk.Misc, window: tk.Toplevel) -> None:
+    """Center a dialog window over the main application window."""
+    parent.update_idletasks()
+    window.update_idletasks()
+
+    parent_x = parent.winfo_rootx()
+    parent_y = parent.winfo_rooty()
+    parent_width = max(parent.winfo_width(), 1)
+    parent_height = max(parent.winfo_height(), 1)
+
+    window_width = max(window.winfo_width(), 1)
+    window_height = max(window.winfo_height(), 1)
+
+    x_pos = parent_x + (parent_width - window_width) // 2
+    y_pos = parent_y + (parent_height - window_height) // 2
+    window.geometry(f"+{max(x_pos, 0)}+{max(y_pos, 0)}")
+
+
+def run_interactive_viewer(payload_path: str) -> int:
+    """Run the standalone Qt/PyQtGraph viewer for one payload file."""
+    try:
+        import numpy as np
+        import pyqtgraph as pg
+        from PySide6 import QtCore, QtGui, QtWidgets
+    except Exception as exc:
+        show_fatal_error(
+            "Der interaktive Viewer konnte nicht gestartet werden.\n\n"
+            "Bitte installieren Sie PySide6, pyqtgraph und numpy.\n\n"
+            f"Technischer Hinweis:\n{exc}"
+        )
+        return 1
+
+    try:
+        with open(payload_path, "r", encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+    finally:
+        try:
+            Path(payload_path).unlink()
+        except OSError:
+            pass
+
+    pg.setConfigOptions(antialias=False, leftButtonPan=True, background="#0a0a0a", foreground="#f0f0f0")
+
+    class SequencePanel(QtWidgets.QWidget):
+        """One scientific scatter view with static background and dynamic trail/head overlays."""
+
+        def __init__(self, title: str):
+            super().__init__()
+            self.points = np.empty((0, 2), dtype=float)
+            self.trail_brush_cache: Dict[int, List[Any]] = {}
+
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+
+            title_label = QtWidgets.QLabel(title)
+            title_font = title_label.font()
+            title_font.setBold(True)
+            title_font.setPointSize(title_font.pointSize() + 1)
+            title_label.setFont(title_font)
+            layout.addWidget(title_label)
+
+            self.plot_widget = pg.PlotWidget()
+            self.plot_widget.setMenuEnabled(False)
+            self.plot_widget.showGrid(x=True, y=True, alpha=0.18)
+            self.plot_widget.getPlotItem().hideButtons()
+            self.plot_widget.getPlotItem().setLabel("left", "Y")
+            self.plot_widget.getPlotItem().setLabel("bottom", "X")
+            self.plot_widget.getViewBox().setMouseEnabled(x=True, y=True)
+            layout.addWidget(self.plot_widget, 1)
+
+            self.background_item = pg.ScatterPlotItem(size=5, pen=None, brush=pg.mkBrush("#232323"), pxMode=True)
+            self.trail_item = pg.ScatterPlotItem(size=8, pen=None, pxMode=True)
+            self.head_item = pg.ScatterPlotItem(size=12, pen=None, brush=pg.mkBrush("#ff3030"), pxMode=True)
+            self.plot_widget.addItem(self.background_item)
+            self.plot_widget.addItem(self.trail_item)
+            self.plot_widget.addItem(self.head_item)
+
+            self.point_label = QtWidgets.QLabel("Point 0 / 0")
+            layout.addWidget(self.point_label)
+
+        def set_points(self, points: Any) -> None:
+            self.points = points
+            if len(points) == 0:
+                self.background_item.setData([], [])
+                self.trail_item.setData([], [])
+                self.head_item.setData([], [])
+                self.point_label.setText("Point 0 / 0")
+                return
+
+            self.background_item.setData(x=self.points[:, 0], y=self.points[:, 1])
+            self.trail_item.setData([], [])
+            self.head_item.setData([], [])
+            self.point_label.setText(f"Point 1 / {len(self.points)}")
+            self.plot_widget.enableAutoRange()
+
+        def _get_trail_brushes(self, count: int) -> List[Any]:
+            brushes = self.trail_brush_cache.get(count)
+            if brushes is None:
+                brushes = [pg.mkBrush(color) for color in build_trail_colors(count)]
+                self.trail_brush_cache[count] = brushes
+            return brushes
+
+        def update_progress(self, progress: float, trail_length: int) -> None:
+            point_count = len(self.points)
+            if point_count == 0:
+                self.point_label.setText("Point 0 / 0")
+                return
+
+            safe_progress = max(0.0, min(float(progress), point_count - 1))
+            base_index = min(max(int(safe_progress), 0), point_count - 1)
+            next_index = min(base_index + 1, point_count - 1)
+            segment_fraction = max(0.0, min(1.0, safe_progress - base_index))
+            start_point = self.points[base_index]
+            end_point = self.points[next_index]
+            head_x = float(start_point[0] + (end_point[0] - start_point[0]) * segment_fraction)
+            head_y = float(start_point[1] + (end_point[1] - start_point[1]) * segment_fraction)
+
+            trail_start = max(0, base_index - trail_length + 1)
+            trail_points = self.points[trail_start : base_index + 1]
+            trail_count = len(trail_points)
+            if trail_count > 0:
+                self.trail_item.setData(
+                    x=trail_points[:, 0],
+                    y=trail_points[:, 1],
+                    brush=self._get_trail_brushes(trail_count),
+                )
+            else:
+                self.trail_item.setData([], [])
+            self.head_item.setData([head_x], [head_y])
+            self.point_label.setText(f"Point {base_index + 1} / {point_count}")
+
+        def pan_by_fraction(self, x_fraction: float, y_fraction: float) -> None:
+            view_box = self.plot_widget.getViewBox()
+            x_range, y_range = view_box.viewRange()
+            x_delta = (x_range[1] - x_range[0]) * x_fraction
+            y_delta = (y_range[1] - y_range[0]) * y_fraction
+            view_box.setRange(
+                xRange=(x_range[0] + x_delta, x_range[1] + x_delta),
+                yRange=(y_range[0] + y_delta, y_range[1] + y_delta),
+                padding=0.0,
+            )
+
+        def reset_view(self) -> None:
+            self.plot_widget.enableAutoRange()
+
+    class SequenceViewerWindow(QtWidgets.QMainWindow):
+        """Standalone scientific viewer with synchronised pan/zoom and live animation."""
+
+        def __init__(self, payload_data: Dict[str, Any]):
+            super().__init__()
+            self.payload = payload_data
+            self.results = [
+                {
+                    **item,
+                    "original_points_np": np.asarray(item["original_points"], dtype=float),
+                    "optimized_points_np": np.asarray(item["optimized_points"], dtype=float),
+                }
+                for item in payload_data["results"]
+            ]
+            self.current_index = 0
+            self.current_progress = 0.0
+            self.sync_guard = False
+
+            self.setWindowTitle(f"{payload_data.get('app_name', APP_DISPLAY_NAME)} - Interactive viewer")
+            self.resize(1560, 920)
+
+            central = QtWidgets.QWidget()
+            self.setCentralWidget(central)
+            outer_layout = QtWidgets.QVBoxLayout(central)
+            outer_layout.setContentsMargins(14, 14, 14, 14)
+            outer_layout.setSpacing(10)
+
+            control_row = QtWidgets.QHBoxLayout()
+            outer_layout.addLayout(control_row)
+
+            control_row.addWidget(QtWidgets.QLabel("Result"))
+            self.result_box = QtWidgets.QComboBox()
+            self.result_box.addItems([item["source_label"] for item in self.results])
+            self.result_box.currentIndexChanged.connect(self._on_result_changed)
+            control_row.addWidget(self.result_box, 1)
+
+            self.play_button = QtWidgets.QPushButton("Pause")
+            self.play_button.clicked.connect(self._toggle_playback)
+            control_row.addWidget(self.play_button)
+
+            control_row.addWidget(QtWidgets.QLabel("Speed"))
+            self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            self.speed_slider.setRange(1, ANIMATION_MAX_MULTIPLIER)
+            self.speed_slider.setValue(60)
+            self.speed_slider.valueChanged.connect(self._update_speed_label)
+            control_row.addWidget(self.speed_slider)
+            self.speed_label = QtWidgets.QLabel()
+            control_row.addWidget(self.speed_label)
+
+            control_row.addWidget(QtWidgets.QLabel("Trail length"))
+            self.trail_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            self.trail_slider.setRange(1, 64)
+            self.trail_slider.setValue(24)
+            self.trail_slider.valueChanged.connect(self._update_trail_label)
+            control_row.addWidget(self.trail_slider)
+            self.trail_label = QtWidgets.QLabel()
+            control_row.addWidget(self.trail_label)
+
+            self.reset_button = QtWidgets.QPushButton("Home")
+            self.reset_button.clicked.connect(self._reset_views)
+            control_row.addWidget(self.reset_button)
+
+            self.info_label = QtWidgets.QLabel()
+            self.info_label.setWordWrap(True)
+            outer_layout.addWidget(self.info_label)
+
+            splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+            outer_layout.addWidget(splitter, 1)
+
+            self.original_panel = SequencePanel("Original")
+            self.optimized_panel = SequencePanel("Optimised")
+            splitter.addWidget(self.original_panel)
+            splitter.addWidget(self.optimized_panel)
+            splitter.setSizes([780, 780])
+
+            self.timer = QtCore.QTimer(self)
+            self.timer.setInterval(VIEWER_TIMER_INTERVAL_MS)
+            self.timer.timeout.connect(self._tick)
+
+            self._connect_synced_views()
+            self._update_speed_label()
+            self._update_trail_label()
+
+            initial_index = int(payload_data.get("selected_index", 0))
+            if 0 <= initial_index < len(self.results):
+                self.result_box.setCurrentIndex(initial_index)
+            else:
+                self._set_result(0)
+
+            self.timer.start()
+
+        def _connect_synced_views(self) -> None:
+            left_view = self.original_panel.plot_widget.getViewBox()
+            right_view = self.optimized_panel.plot_widget.getViewBox()
+
+            def sync_range(source_view: Any, target_view: Any) -> None:
+                if self.sync_guard:
+                    return
+                self.sync_guard = True
+                x_range, y_range = source_view.viewRange()
+                target_view.setRange(xRange=x_range, yRange=y_range, padding=0.0)
+                self.sync_guard = False
+
+            left_view.sigRangeChanged.connect(lambda *_args: sync_range(left_view, right_view))
+            right_view.sigRangeChanged.connect(lambda *_args: sync_range(right_view, left_view))
+
+        def _set_result(self, index: int) -> None:
+            if not self.results:
+                return
+            self.current_index = max(0, min(index, len(self.results) - 1))
+            result = self.results[self.current_index]
+            self.current_progress = 0.0
+            point_count = max(len(result["original_points_np"]), len(result["optimized_points_np"]), 1)
+            self.trail_slider.setMaximum(max(1, min(point_count, 512)))
+            if self.trail_slider.value() > self.trail_slider.maximum():
+                self.trail_slider.setValue(self.trail_slider.maximum())
+            self.original_panel.set_points(result["original_points_np"])
+            self.optimized_panel.set_points(result["optimized_points_np"])
+            self._reset_views()
+            self._update_info_label()
+            self._update_panels()
+
+        def _update_info_label(self) -> None:
+            result = self.results[self.current_index]
+            archive_member = result.get("archive_member")
+            source_hint = f"Archiv-Eintrag: {archive_member}" if archive_member else f"Quelle: {result['source_path']}"
+            self.info_label.setText(
+                f"Mode: {self.payload.get('mode_label', '')} | {source_hint} | "
+                f"Output name: {result['output_name']} | Points: {result['point_count']}"
+            )
+
+        def _update_speed_label(self) -> None:
+            points_per_second = min(VIEWER_POINTS_PER_SECOND_MAX, VIEWER_POINTS_PER_SECOND_BASE * self.speed_slider.value())
+            self.speed_label.setText(f"{points_per_second:.1f} points/s")
+
+        def _update_trail_label(self) -> None:
+            self.trail_label.setText(f"{self.trail_slider.value()} points")
+            self._update_panels()
+
+        def _toggle_playback(self) -> None:
+            if self.timer.isActive():
+                self.timer.stop()
+                self.play_button.setText("Play")
+            else:
+                self.timer.start()
+                self.play_button.setText("Pause")
+
+        def _reset_views(self) -> None:
+            self.original_panel.reset_view()
+            self.optimized_panel.reset_view()
+
+        def _update_panels(self) -> None:
+            if not self.results:
+                return
+            trail_length = self.trail_slider.value()
+            self.original_panel.update_progress(self.current_progress, trail_length)
+            self.optimized_panel.update_progress(self.current_progress, trail_length)
+
+        def _tick(self) -> None:
+            if not self.results:
+                return
+            result = self.results[self.current_index]
+            point_count = max(len(result["original_points_np"]), len(result["optimized_points_np"]))
+            if point_count <= 1:
+                self._update_panels()
+                return
+            step = (min(VIEWER_POINTS_PER_SECOND_MAX, VIEWER_POINTS_PER_SECOND_BASE * self.speed_slider.value()) *
+                (self.timer.interval() / 1000.0))
+            self.current_progress += step
+            if self.current_progress >= point_count - 1:
+                self.current_progress = 0.0
+            self._update_panels()
+
+        def _on_result_changed(self, index: int) -> None:
+            self._set_result(index)
+
+        def keyPressEvent(self, event: Any) -> None:
+            key = event.key()
+            if key == QtCore.Qt.Key.Key_Home:
+                self._reset_views()
+                return
+            if key == QtCore.Qt.Key.Key_Left:
+                self.original_panel.pan_by_fraction(-0.08, 0.0)
+                return
+            if key == QtCore.Qt.Key.Key_Right:
+                self.original_panel.pan_by_fraction(0.08, 0.0)
+                return
+            if key == QtCore.Qt.Key.Key_Up:
+                self.original_panel.pan_by_fraction(0.0, 0.08)
+                return
+            if key == QtCore.Qt.Key.Key_Down:
+                self.original_panel.pan_by_fraction(0.0, -0.08)
+                return
+            super().keyPressEvent(event)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setApplicationName(APP_DISPLAY_NAME)
+    window = SequenceViewerWindow(payload)
+    window.show()
+    return app.exec()
+
+
+def interpolate_color(start_rgb: Tuple[int, int, int], end_rgb: Tuple[int, int, int], t: float) -> str:
+    """Return a hex color linearly interpolated between two RGB colors."""
+    clamped_t = max(0.0, min(1.0, t))
+    r = int(round(start_rgb[0] + (end_rgb[0] - start_rgb[0]) * clamped_t))
+    g = int(round(start_rgb[1] + (end_rgb[1] - start_rgb[1]) * clamped_t))
+    b = int(round(start_rgb[2] + (end_rgb[2] - start_rgb[2]) * clamped_t))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def build_trail_colors(count: int) -> List[str]:
+    """Build a white-to-red color gradient for the visible trail points."""
+    if count <= 1:
+        return ["#ff1010"]
+
+    start_rgb = (255, 255, 255)
+    end_rgb = (255, 16, 16)
+    return [
+        interpolate_color(start_rgb, end_rgb, index / (count - 1))
+        for index in range(count)
+    ]
+
+
+def build_gradient_bin_ranges(start_index: int, end_index: int, bin_count: int) -> List[Tuple[int, int]]:
+    """Split an inclusive point range into contiguous bins from old to new."""
+    if end_index < start_index or bin_count <= 0:
+        return []
+
+    point_count = end_index - start_index + 1
+    safe_bin_count = max(1, min(bin_count, point_count))
+    ranges: List[Tuple[int, int]] = []
+
+    for bin_index in range(safe_bin_count):
+        bin_start_offset = (bin_index * point_count) // safe_bin_count
+        bin_end_offset = ((bin_index + 1) * point_count) // safe_bin_count - 1
+        ranges.append((start_index + bin_start_offset, start_index + bin_end_offset))
+
+    return ranges
+
+
+def inclusive_range_difference(
+    new_range: Optional[Tuple[int, int]],
+    old_range: Optional[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    """Return the inclusive sub-ranges that are present in new_range but not in old_range."""
+    if new_range is None:
+        return []
+    if old_range is None:
+        return [new_range]
+
+    new_start, new_end = new_range
+    old_start, old_end = old_range
+
+    if old_end < new_start or old_start > new_end:
+        return [new_range]
+
+    segments: List[Tuple[int, int]] = []
+    if new_start < old_start:
+        segments.append((new_start, min(new_end, old_start - 1)))
+    if new_end > old_end:
+        segments.append((max(new_start, old_end + 1), new_end))
+    return segments
+
+
+def compute_bounds(result: ProcessedFileResult) -> Tuple[float, float, float, float]:
+    """Return display bounds based only on the original source point cloud."""
+    return compute_point_bounds(result.original_points)
+
+
+def build_animation_plan(
+    point_count: int,
+    speed_multiplier: int,
+    progress_callback: ProgressCallback = None,
+    cancel_event: object = None,
+) -> AnimationPlan:
+    """Precompute the full animation timeline at a fixed 30 FPS."""
+    raise_if_cancelled(cancel_event)
+    safe_multiplier = max(ANIMATION_MIN_MULTIPLIER, min(ANIMATION_MAX_MULTIPLIER, int(speed_multiplier)))
+    points_per_second = ANIMATION_BASE_POINTS_PER_SECOND * safe_multiplier
+    fps = ANIMATION_MAX_FPS
+
+    if point_count <= 1:
+        progress_values = array("f", [0.0])
+        if progress_callback is not None:
+            progress_callback(1.0, "1 / 1 Frames vorbereitet")
+        return AnimationPlan(
+            progress_values=progress_values,
+            frame_count=1,
+            fps=fps,
+            points_per_second=points_per_second,
+            speed_multiplier=safe_multiplier,
+        )
+
+    points_per_frame = points_per_second / fps
+    total_frames = max(2, int(math.ceil((point_count - 1) / points_per_frame)) + 1)
+    report_every = max(1, total_frames // 200)
+    progress_values = array("f")
+
+    for frame_index in range(total_frames):
+        if frame_index % 64 == 0:
+            raise_if_cancelled(cancel_event)
+        progress = min(frame_index * points_per_frame, point_count - 1)
+        progress_values.append(progress)
+        if progress_callback is not None and (
+            frame_index == total_frames - 1 or frame_index % report_every == 0
+        ):
+            progress_callback((frame_index + 1) / total_frames, f"{frame_index + 1} / {total_frames} Frames vorbereitet")
+
+    return AnimationPlan(
+        progress_values=progress_values,
+        frame_count=total_frames,
+        fps=fps,
+        points_per_second=points_per_second,
+        speed_multiplier=safe_multiplier,
+    )
+
+
+def process_file_in_subprocess(
+    file_index: int,
+    total_files: int,
+    input_source: InputSource,
+    w1: float,
+    w2: float,
+    memory: int,
+    mode: str,
+    progress_queue: object = None,
+    grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
+    recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
+    age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    cancel_event: object = None,
+) -> Tuple[int, int, str, ProcessedFileResult]:
+    """Process one file in a separate process and forward progress messages."""
+    normalized_source = normalize_input_source(input_source)
+    file_name = normalized_source.source_label
+
+    def progress_callback(fraction: float, detail: str) -> None:
+        if progress_queue is not None:
+            progress_queue.put(("file_progress", file_index, total_files, file_name, fraction, detail))
+
+    result = process_file(
+        source=normalized_source,
+        w1=w1,
+        w2=w2,
+        memory=memory,
+        mode=mode,
+        progress_callback=progress_callback if progress_queue is not None else None,
+        grid_spacing=grid_spacing,
+        recent_percent=recent_percent,
+        age_decay=age_decay,
+        cancel_event=cancel_event,
+    )
+    return (file_index, total_files, file_name, result)
+
+
+def build_animation_plan_in_subprocess(
+    result_index: int,
+    file_name: str,
+    point_count: int,
+    speed_multiplier: int,
+    progress_queue: object = None,
+    cancel_event: object = None,
+) -> Tuple[int, str, int, AnimationPlan]:
+    """Prepare the animation timeline in a separate process and forward progress."""
+
+    def progress_callback(fraction: float, detail: str) -> None:
+        if progress_queue is not None:
+            progress_queue.put(("animation_progress", result_index, file_name, speed_multiplier, fraction, detail))
+
+    plan = build_animation_plan(
+        point_count=point_count,
+        speed_multiplier=speed_multiplier,
+        progress_callback=progress_callback if progress_queue is not None else None,
+        cancel_event=cancel_event,
+    )
+    return (result_index, file_name, speed_multiplier, plan)
+
+
+class ComparisonApp(tk.Tk):
+    """Desktop UI with file selection, visible progress and animation preview."""
+
+    def __init__(
+        self,
+        initial_files: Sequence[str],
+        w1: float,
+        w2: float,
+        memory: int,
+        mode: str,
+        grid_spacing: float,
+        recent_percent: float,
+        age_decay: float,
+    ):
+        super().__init__()
+        self.w1 = w1
+        self.w2 = w2
+        self.memory = memory
+        self.mode = normalize_mode(mode)
+        self.grid_spacing = grid_spacing
+        self.recent_percent = recent_percent
+        self.age_decay = age_decay
+        self.zip_entry_type = "infill"
+        self.zip_support_end_layer = 0
+        self.initial_files = tuple(initial_files)
+        self.selected_input_files = tuple(initial_files)
+        self.selected_sources: Tuple[InputSource, ...] = tuple()
+
+        self.max_process_workers = max(1, os.cpu_count() or 1)
+        self.mp_context = mp.get_context("spawn")
+        self.mp_manager = self.mp_context.Manager()
+        self.process_progress_queue = self.mp_manager.Queue()
+        self.process_cancel_event = self.mp_manager.Event()
+        self.animation_cancel_event = self.mp_manager.Event()
+        self.process_pool = ProcessPoolExecutor(
+            max_workers=self.max_process_workers,
+            mp_context=self.mp_context,
+        )
+
+        self.results: List[ProcessedFileResult] = []
+        self.errors: List[str] = []
+        self.cancelled_files: List[str] = []
+        self.total_files = 0
+        self.completed_files = 0
+        self.file_progress_map: Dict[int, float] = {}
+        self.result_map: Dict[int, ProcessedFileResult] = {}
+        self.error_map: Dict[int, str] = {}
+        self.cancelled_map: Dict[int, str] = {}
+        self.worker_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+        self.current_result: Optional[ProcessedFileResult] = None
+        self.current_bounds: Optional[Tuple[float, float, float, float]] = None
+        self.animation_plan: Optional[AnimationPlan] = None
+        self.animation_frame_index = 0
+        self.animation_index = 0
+        self.animation_job: Optional[str] = None
+        self.queue_poll_job: Optional[str] = None
+        self.loading_job: Optional[str] = None
+        self.resize_refresh_job: Optional[str] = None
+        self.prepare_animation_job: Optional[str] = None
+        self.animation_prepare_active = False
+        self.animation_future: Optional[Future] = None
+        self.animation_progress_fraction = 0.0
+        self.animation_paused = False
+        self.pending_animation_prepare: Optional[Tuple[int, int]] = None
+        self.processing_active = False
+        self.processing_cancel_requested = False
+        self.animation_cancel_requested = False
+        self.zip_saved = False
+        self.current_progress_fraction = 0.0
+        self.loading_message = ""
+        self.loading_tick = 0
+        self.view_zoom = 1.0
+        self.processing_started_at: Optional[float] = None
+        self.processing_total_seconds = 0.0
+        self.current_operation_started_at: Optional[float] = None
+        self.last_animation_prepare_seconds = 0.0
+        self.viewer_processes: List[subprocess.Popen[Any]] = []
+
+        self.file_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Bitte Dateien auswaehlen.")
+        self.progress_var = tk.StringVar(value="Noch keine Verarbeitung gestartet.")
+        self.timer_var = tk.StringVar(value="Laufzeit: 00:00:00.0")
+        self.original_label_var = tk.StringVar(value="Punkt 0 / 0")
+        self.optimized_label_var = tk.StringVar(value="Punkt 0 / 0")
+        self.animation_speed_var = tk.IntVar(value=ANIMATION_MIN_MULTIPLIER)
+        self.animation_speed_label_var = tk.StringVar()
+        self.trail_count_var = tk.IntVar(value=TRAIL_DEFAULT_POINTS)
+        self.trail_count_label_var = tk.StringVar()
+        self.pause_button_var = tk.StringVar(value="Play")
+        self.cancel_button_var = tk.StringVar(value="Abbrechen")
+        self.animation_ready = False
+        self.last_confirmed_speed = int(self.animation_speed_var.get())
+        self.last_confirmed_trail = int(self.trail_count_var.get())
+        self.trail_color_cache: Dict[int, List[str]] = {}
+
+        self.title(APP_DISPLAY_NAME)
+        self.geometry("1240x860")
+        self.minsize(1140, 800)
+        self.configure(bg="#111111")
+        self.protocol("WM_DELETE_WINDOW", self._handle_close)
+
+        self._build_ui()
+        self._update_animation_speed_label()
+        self._update_trail_count_label()
+        self._reset_preview("Bitte zuerst Dateien auswaehlen und verarbeiten.")
+
+        if self.initial_files:
+            self.after(200, lambda: self._start_processing_flow(self.initial_files))
+        else:
+            self.after(250, self._prompt_for_files)
+
+    def _build_ui(self) -> None:
+        header = tk.Frame(self, bg="#181818", padx=14, pady=12)
+        header.pack(fill="x")
+
+        ttk.Button(header, text="Dateien auswaehlen...", command=self._prompt_for_files).pack(side="left")
+        self.recalculate_button = ttk.Button(
+            header,
+            text="Neu berechnen...",
+            command=self._recalculate_current_files,
+            state="normal" if self.selected_input_files else "disabled",
+        )
+        self.recalculate_button.pack(side="left", padx=(10, 0))
+        self.cancel_button = ttk.Button(
+            header,
+            textvariable=self.cancel_button_var,
+            command=self._cancel_active_work,
+            state="disabled",
+        )
+        self.cancel_button.pack(side="left", padx=(10, 0))
+        self.zip_button = ttk.Button(header, text="ZIP speichern...", command=self._save_zip, state="disabled")
+        self.zip_button.pack(side="left", padx=(10, 0))
+        ttk.Button(header, text="Schliessen", command=self._handle_close).pack(side="left", padx=(10, 0))
+
+        tk.Label(
+            header,
+            textvariable=self.status_var,
+            bg="#181818",
+            fg="#d0d0d0",
+            font=("Segoe UI", 10),
+        ).pack(side="right")
+
+        body_container = tk.Frame(self, bg="#111111")
+        body_container.pack(fill="both", expand=True)
+
+        self.main_scroll_canvas = tk.Canvas(
+            body_container,
+            bg="#111111",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.main_scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        self.main_scrollbar = ttk.Scrollbar(
+            body_container,
+            orient="vertical",
+            command=self.main_scroll_canvas.yview,
+        )
+        self.main_scrollbar.pack(side="right", fill="y")
+        self.main_scroll_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+
+        self.main_content = tk.Frame(self.main_scroll_canvas, bg="#111111")
+        self.main_scroll_window = self.main_scroll_canvas.create_window(
+            (0, 0),
+            window=self.main_content,
+            anchor="nw",
+        )
+        self.main_content.bind("<Configure>", self._on_main_content_configure)
+        self.main_scroll_canvas.bind("<Configure>", self._on_main_canvas_configure)
+
+        progress_frame = tk.Frame(self.main_content, bg="#111111", padx=14, pady=12)
+        progress_frame.pack(fill="x")
+
+        tk.Label(
+            progress_frame,
+            text="Verarbeitung",
+            bg="#111111",
+            fg="#f0f0f0",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+
+        self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate", maximum=1, value=0)
+        self.progress_bar.pack(fill="x", pady=(8, 4))
+
+        tk.Label(
+            progress_frame,
+            textvariable=self.progress_var,
+            bg="#111111",
+            fg="#d7d7d7",
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+        ).pack(fill="x")
+
+        tk.Label(
+            progress_frame,
+            textvariable=self.timer_var,
+            bg="#111111",
+            fg="#bcbcbc",
+            font=("Consolas", 10),
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(4, 0))
+
+        selection_frame = tk.Frame(self.main_content, bg="#111111", padx=14, pady=8)
+        selection_frame.pack(fill="x")
+
+        tk.Label(
+            selection_frame,
+            text="Ergebnis anzeigen:",
+            bg="#111111",
+            fg="#f0f0f0",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left")
+
+        self.file_selector = ttk.Combobox(
+            selection_frame,
+            values=[],
+            textvariable=self.file_var,
+            state="disabled",
+            width=60,
+        )
+        self.file_selector.pack(side="left", padx=(10, 10))
+        self.file_selector.bind("<<ComboboxSelected>>", self._on_result_selected)
+
+        action_frame = tk.Frame(self.main_content, bg="#111111", padx=14, pady=8)
+        action_frame.pack(fill="x")
+
+        self.viewer_button = ttk.Button(
+            action_frame,
+            text="Interactive viewer oeffnen",
+            command=self._open_interactive_viewer,
+            state="disabled",
+        )
+        self.viewer_button.pack(side="left")
+        self.preview_button = self.viewer_button
+
+        self.pause_button = ttk.Button(
+            action_frame,
+            textvariable=self.pause_button_var,
+            command=self._toggle_pause,
+            state="disabled",
+        )
+
+        tk.Label(
+            action_frame,
+            text=(
+                "Der Viewer laeuft in einem separaten Qt/PyQtGraph-Fenster mit Zoom, Panning, "
+                "Dateiauswahl, Animation und synchronisierten Achsen."
+            ),
+            bg="#111111",
+            fg="#d0d0d0",
+            font=("Segoe UI", 10),
+            justify="left",
+        ).pack(side="left", padx=(14, 0))
+
+        info_frame = tk.Frame(self.main_content, bg="#111111", padx=14, pady=10)
+        info_frame.pack(fill="x")
+
+        self.file_info_label = tk.Label(
+            info_frame,
+            bg="#111111",
+            fg="#f5f5f5",
+            anchor="w",
+            justify="left",
+            font=("Consolas", 10),
+        )
+        self.file_info_label.pack(fill="x")
+
+        stats_frame = tk.Frame(self.main_content, bg="#111111", padx=14)
+        stats_frame.pack(fill="x")
+
+        self.original_stats_label = tk.Label(
+            stats_frame,
+            bg="#111111",
+            fg="#f1f1f1",
+            anchor="nw",
+            justify="left",
+            font=("Consolas", 10),
+        )
+        self.original_stats_label.pack(side="left", fill="both", expand=True)
+
+        self.optimized_stats_label = tk.Label(
+            stats_frame,
+            bg="#111111",
+            fg="#f1f1f1",
+            anchor="nw",
+            justify="left",
+            font=("Consolas", 10),
+        )
+        self.optimized_stats_label.pack(side="left", fill="both", expand=True, padx=(20, 0))
+
+        viewer_notes = tk.Frame(self.main_content, bg="#0d0d0d", padx=14, pady=14, bd=1, relief="solid")
+        viewer_notes.pack(fill="x", padx=14, pady=(8, 14))
+
+        tk.Label(
+            viewer_notes,
+            text="Interaktive Visualisierung",
+            bg="#0d0d0d",
+            fg="#f4f4f4",
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+
+        tk.Label(
+            viewer_notes,
+            text=(
+                "Oeffnen Sie den separaten Viewer fuer eine fluessigere Darstellung. "
+                "Dort stehen Mausrad-Zoom, linkes Maus-Panning, Pfeiltasten-Navigation, "
+                "Home-Reset, Play/Pause, Speed und Trail Length zur Verfuegung."
+            ),
+            bg="#0d0d0d",
+            fg="#d8d8d8",
+            font=("Segoe UI", 10),
+            justify="left",
+            anchor="w",
+            wraplength=1080,
+        ).pack(fill="x", pady=(8, 0))
+
+        # Hidden compatibility widgets: the legacy in-window animation code is no longer surfaced,
+        # but a few helper methods still expect these objects to exist.
+        self.speed_slider = tk.Scale(
+            self.main_content,
+            from_=ANIMATION_MIN_MULTIPLIER,
+            to=ANIMATION_MAX_MULTIPLIER,
+            orient="horizontal",
+            resolution=1,
+            showvalue=False,
+            variable=self.animation_speed_var,
+            command=self._on_speed_changed,
+        )
+        self.trail_slider = tk.Scale(
+            self.main_content,
+            from_=TRAIL_MIN_POINTS,
+            to=TRAIL_MAX_POINTS,
+            orient="horizontal",
+            resolution=1,
+            showvalue=False,
+            variable=self.trail_count_var,
+            command=self._on_trail_count_changed,
+        )
+
+    def _on_main_content_configure(self, _event: tk.Event) -> None:
+        """Keep the scroll region in sync with the full UI content height."""
+        self.main_scroll_canvas.configure(scrollregion=self.main_scroll_canvas.bbox("all"))
+
+    def _on_main_canvas_configure(self, event: tk.Event) -> None:
+        """Stretch the embedded content frame to the visible canvas width."""
+        self.main_scroll_canvas.itemconfigure(self.main_scroll_window, width=event.width)
+
+    def _build_panel(self, parent: tk.Misc, title: str, label_var: tk.StringVar) -> tk.Frame:
+        panel = tk.Frame(parent, bg="#070707", bd=1, relief="solid", padx=12, pady=12)
+
+        tk.Label(
+            panel,
+            text=title,
+            bg="#070707",
+            fg="#f3f3f3",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w")
+
+        canvas = tk.Canvas(
+            panel,
+            width=560,
+            height=560,
+            bg="#000000",
+            highlightthickness=1,
+            highlightbackground="#202020",
+        )
+        canvas.pack(fill="both", expand=True, pady=(10, 8))
+        canvas.bind("<Configure>", self._on_canvas_resized)
+        canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
+        canvas.bind("<Button-4>", self._on_canvas_mousewheel)
+        canvas.bind("<Button-5>", self._on_canvas_mousewheel)
+        panel.canvas = canvas
+
+        tk.Label(
+            panel,
+            textvariable=label_var,
+            bg="#070707",
+            fg="#dddddd",
+            font=("Segoe UI", 11),
+        ).pack(anchor="w")
+
+        return panel
+
+    def _enqueue_file_future_result(
+        self,
+        future: Future,
+        file_index: int,
+        total_files: int,
+        input_source: InputSource,
+    ) -> None:
+        """Forward a completed file-processing future into the UI queue."""
+        self.worker_queue.put(("file_future_done", file_index, total_files, input_source, future))
+
+    def _enqueue_animation_future_result(self, future: Future, result_index: int, speed_multiplier: int) -> None:
+        """Forward a completed animation-preparation future into the UI queue."""
+        self.worker_queue.put(("animation_future_done", result_index, speed_multiplier, future))
+
+    def _show_animation_compute_button(self) -> None:
+        """Show the button that opens the external interactive viewer."""
+        if not self.preview_button.winfo_ismapped():
+            self.preview_button.pack(side="left")
+        self.preview_button.config(state="normal" if self.results else "disabled")
+        if self.pause_button.winfo_ismapped():
+            self.pause_button.pack_forget()
+
+    def _show_pause_button(self) -> None:
+        """Legacy no-op retained for compatibility after moving animation into the Qt viewer."""
+        self.pause_button.config(state="disabled")
+
+    def _set_timer_text(self, prefix: str, seconds: float, include_tenths: bool = True) -> None:
+        """Update the visible timer label."""
+        self.timer_var.set(f"{prefix}: {format_duration(seconds, include_tenths=include_tenths)}")
+
+    def _set_cancel_button_state(self, enabled: bool, running_text: str = "Abbrechen") -> None:
+        """Update cancel button state and label consistently."""
+        self.cancel_button_var.set(running_text if enabled else "Abbrechen")
+        self.cancel_button.config(state="normal" if enabled else "disabled")
+
+    def _cancel_active_work(self) -> None:
+        """Request cooperative cancellation for the current processing step."""
+        if self.processing_active:
+            if self.processing_cancel_requested:
+                return
+            answer = messagebox.askyesno(
+                "Berechnung abbrechen",
+                "Die Dateiverarbeitung laeuft noch.\n\nSoll die Berechnung abgebrochen werden?",
+                parent=self,
+            )
+            if not answer:
+                return
+            self.processing_cancel_requested = True
+            self.process_cancel_event.set()
+            self.loading_message = "Abbruch der Dateiverarbeitung wird angefordert"
+            self.status_var.set("Abbruch der Dateiverarbeitung wurde angefordert.")
+            self._set_cancel_button_state(False)
+            return
+
+        if self.animation_prepare_active:
+            if self.animation_cancel_requested:
+                return
+            answer = messagebox.askyesno(
+                "Animation abbrechen",
+                "Die Animationsvorbereitung laeuft noch.\n\nSoll sie abgebrochen werden?",
+                parent=self,
+            )
+            if not answer:
+                return
+            self.animation_cancel_requested = True
+            self.animation_cancel_event.set()
+            self.loading_message = "Abbruch der Animationsvorbereitung wird angefordert"
+            self.status_var.set("Abbruch der Animationsvorbereitung wurde angefordert.")
+            self._set_cancel_button_state(False)
+            return
+
+        messagebox.showinfo("Abbrechen", "Es laeuft gerade keine Berechnung.", parent=self)
+
+    def _clear_prepared_animation(self, keep_current_result: bool = True) -> None:
+        """Delete the prepared animation and return to the calculation state."""
+        if self.animation_job is not None:
+            self.after_cancel(self.animation_job)
+            self.animation_job = None
+
+        self.animation_plan = None
+        self.animation_ready = False
+        self.animation_frame_index = 0
+        self.animation_index = 0
+        self.animation_paused = False
+        self.pause_button_var.set("Play")
+        self.pending_animation_prepare = None
+        self.animation_future = None
+        self.animation_prepare_active = False
+        self.animation_cancel_requested = False
+        self.animation_cancel_event.clear()
+        self._show_animation_compute_button()
+        self.pause_button.config(state="disabled")
+        self.speed_slider.config(state="normal")
+        self.trail_slider.config(state="normal")
+        self.file_selector.config(state="readonly" if self.results else "disabled")
+        self.current_progress_fraction = 0.0
+        self.animation_progress_fraction = 0.0
+        self._set_cancel_button_state(False)
+
+        if keep_current_result and self.current_result is not None:
+            self._load_result(self.results.index(self.current_result), start_playback=False)
+            self.status_var.set("Animation geloescht. Jetzt 'Animation berechnen' klicken.")
+
+    def _confirm_delete_animation_for_slider_change(self, slider_name: str, new_value: int) -> bool:
+        """Ask whether a prepared animation should be discarded after a slider change."""
+        if not self.animation_ready:
+            return True
+
+        answer = messagebox.askyesno(
+            "Animation loeschen?",
+            f"Die vorhandene Animation wurde schon berechnet.\n\n"
+            f"Soll sie wegen der Aenderung an '{slider_name}' geloescht werden?",
+            parent=self,
+        )
+        if answer:
+            self._clear_prepared_animation(keep_current_result=True)
+        return answer
+
+    def _drain_process_progress_queue(self) -> None:
+        """Drain progress messages emitted by subprocesses."""
+        while True:
+            try:
+                message = self.process_progress_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = message[0]
+            if kind == "file_progress":
+                _, file_index, total_files, file_name, fraction, detail = message
+                if self.processing_active:
+                    self.file_progress_map[file_index] = max(0.0, min(float(fraction), 1.0))
+                    if self.processing_cancel_requested:
+                        self.loading_message = "Abbruch der Dateiverarbeitung wird angefordert"
+                    else:
+                        self.loading_message = f"Datei {file_index} / {total_files}: {file_name} - {detail}"
+                    self.current_progress_fraction = self.file_progress_map[file_index]
+                    self._update_progress_widgets()
+            elif kind == "animation_progress":
+                _, result_index, file_name, speed_multiplier, fraction, detail = message
+                if (
+                    self.animation_prepare_active
+                    and self.current_result is not None
+                    and result_index < len(self.results)
+                    and self.results[result_index].source_label == file_name
+                    and int(self.animation_speed_var.get()) == speed_multiplier
+                ):
+                    self.animation_progress_fraction = max(0.0, min(float(fraction), 1.0))
+                    if self.animation_cancel_requested:
+                        self.loading_message = "Abbruch der Animationsvorbereitung wird angefordert"
+                        self.progress_var.set("Abbruch angefordert - warte auf Rueckmeldung der Worker")
+                    else:
+                        self.loading_message = f"Berechne Animation: {file_name} - {detail}"
+                        self.progress_var.set(detail)
+                    self.progress_bar.config(maximum=1.0, value=self.animation_progress_fraction)
+
+    def _get_animation_timing(self) -> Tuple[float, float, float, int]:
+        """Return points-per-second, FPS, points-per-frame and timer interval."""
+        multiplier = max(
+            ANIMATION_MIN_MULTIPLIER,
+            min(ANIMATION_MAX_MULTIPLIER, int(self.animation_speed_var.get())),
+        )
+        points_per_second = ANIMATION_BASE_POINTS_PER_SECOND * multiplier
+        frames_per_second = ANIMATION_MAX_FPS
+        points_per_frame = points_per_second / frames_per_second
+        interval_ms = max(1, int(round(1000.0 / frames_per_second)))
+        return (points_per_second, frames_per_second, points_per_frame, interval_ms)
+
+    def _update_animation_speed_label(self) -> None:
+        """Refresh the slider label for speed and FPS information."""
+        points_per_second, frames_per_second, _, _ = self._get_animation_timing()
+        self.animation_speed_label_var.set(
+            f"{int(self.animation_speed_var.get())}x | {points_per_second:.1f} Punkte/s | {frames_per_second:.1f} FPS"
+        )
+
+    def _update_trail_count_label(self) -> None:
+        """Refresh the label for the number of visible gradient points."""
+        self.trail_count_label_var.set(f"{int(self.trail_count_var.get())} Punkte")
+
+    def _update_trail_slider_range(self, point_count: int) -> None:
+        """Adapt the trail slider to the number of points in the active file."""
+        max_points = max(TRAIL_MIN_POINTS, int(point_count))
+        self.trail_slider.config(to=max_points)
+        if self.trail_count_var.get() > max_points:
+            self.trail_count_var.set(max_points)
+        self._update_trail_count_label()
+
+    def _on_speed_changed(self, _value: str) -> None:
+        """Apply a new animation speed from the slider."""
+        self._update_animation_speed_label()
+        new_speed = int(self.animation_speed_var.get())
+        if self.current_result is None:
+            self.last_confirmed_speed = new_speed
+            return
+
+        if new_speed == self.last_confirmed_speed:
+            return
+
+        if self.animation_prepare_active:
+            self.animation_speed_var.set(self.last_confirmed_speed)
+            self._update_animation_speed_label()
+            messagebox.showinfo(
+                "Animation",
+                "Waehrend die Animation berechnet wird, kann die Geschwindigkeit nicht geaendert werden.",
+                parent=self,
+            )
+            return
+
+        if self.animation_ready and not self._confirm_delete_animation_for_slider_change("Geschwindigkeit", new_speed):
+            self.animation_speed_var.set(self.last_confirmed_speed)
+            self._update_animation_speed_label()
+            return
+
+        self.last_confirmed_speed = new_speed
+
+    def _on_trail_count_changed(self, _value: str) -> None:
+        """Apply a new count for visible gradient trail points."""
+        self._update_trail_count_label()
+        new_trail = int(self.trail_count_var.get())
+        had_prepared_animation = self.animation_ready
+        if self.current_result is None:
+            self.last_confirmed_trail = new_trail
+            return
+
+        if new_trail == self.last_confirmed_trail:
+            return
+
+        if self.animation_prepare_active:
+            self.trail_count_var.set(self.last_confirmed_trail)
+            self._update_trail_count_label()
+            messagebox.showinfo(
+                "Animation",
+                "Waehrend die Animation berechnet wird, kann der Gradient nicht geaendert werden.",
+                parent=self,
+            )
+            return
+
+        if self.animation_ready and not self._confirm_delete_animation_for_slider_change("Gradient-Punkte", new_trail):
+            self.trail_count_var.set(self.last_confirmed_trail)
+            self._update_trail_count_label()
+            return
+
+        self.last_confirmed_trail = new_trail
+        if not had_prepared_animation:
+            self.status_var.set(
+                "Gradient-Wert aktualisiert. Er wird bei der naechsten Animationsberechnung verwendet."
+            )
+
+    def _on_canvas_resized(self, _event: tk.Event) -> None:
+        """Rebuild cached canvas geometry after the preview size changes."""
+        if self.current_result is None:
+            return
+        self._schedule_view_refresh(120)
+
+    def _schedule_view_refresh(self, delay_ms: int = 120) -> None:
+        """Throttle expensive preview rebuilds after resize or zoom changes."""
+        if self.current_result is None:
+            return
+        if self.resize_refresh_job is not None:
+            self.after_cancel(self.resize_refresh_job)
+        self.resize_refresh_job = self.after(delay_ms, self._refresh_current_view)
+
+    def _on_canvas_mousewheel(self, event: tk.Event) -> str:
+        """Zoom both preview panels with the mouse wheel."""
+        if self.current_result is None:
+            return "break"
+
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        if delta > 0 or num == 4:
+            zoom_factor = 1.15
+        elif delta < 0 or num == 5:
+            zoom_factor = 1.0 / 1.15
+        else:
+            return "break"
+
+        new_zoom = min(25.0, max(0.2, self.view_zoom * zoom_factor))
+        if abs(new_zoom - self.view_zoom) < 1e-9:
+            return "break"
+
+        self.view_zoom = new_zoom
+        self.status_var.set(f"Zoom: {self.view_zoom * 100:.0f}%")
+        self._schedule_view_refresh(40)
+        return "break"
+
+    def _refresh_current_view(self) -> None:
+        """Recompute the cached preview points so the zoom fits the current canvas size."""
+        self.resize_refresh_job = None
+        if self.current_result is None:
+            return
+        self._prepare_canvas_view(self.original_panel.canvas, self.current_result.original_points)
+        self._prepare_canvas_view(self.optimized_panel.canvas, self.current_result.optimized_points)
+        self._draw_current_frame()
+
+    def _recalculate_current_files(self) -> None:
+        """Restart processing for the already selected files with new parameters."""
+        if self.processing_active or self.animation_prepare_active:
+            messagebox.showinfo(
+                "Neu berechnen",
+                "Bitte warten Sie, bis die aktuelle Verarbeitung abgeschlossen ist.",
+                parent=self,
+            )
+            return
+
+        if not self.selected_input_files:
+            messagebox.showinfo(
+                "Neu berechnen",
+                "Es wurden noch keine Eingabedateien ausgewaehlt.",
+                parent=self,
+            )
+            return
+
+        self._start_processing_flow(self.selected_input_files)
+
+    def _prompt_for_files(self) -> None:
+        if self.processing_active:
+            return
+
+        selected_files = ask_for_input_files(self)
+        if not selected_files:
+            self.status_var.set("Keine Dateien ausgewaehlt. Das Fenster bleibt offen.")
+            self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
+            return
+
+        self.selected_input_files = tuple(selected_files)
+        self.recalculate_button.config(state="normal")
+        self._start_processing_flow(selected_files)
+
+    def _start_processing_flow(self, selected_files: Sequence[str]) -> None:
+        """Ask for the optimization settings and then start file processing."""
+        settings = ask_for_optimization_settings(
+            self,
+            current_mode=self.mode,
+            current_memory=self.memory,
+            current_grid_spacing=self.grid_spacing,
+            current_recent_percent=self.recent_percent,
+        )
+        if settings is None:
+            self.status_var.set("Dateiauswahl abgebrochen. Keine Verarbeitung gestartet.")
+            self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
+            return
+
+        self.mode = str(settings["mode"])
+        self.memory = int(settings["memory"])
+        self.grid_spacing = float(settings["grid_spacing"])
+        self.recent_percent = float(settings["recent_percent"])
+        self.age_decay = float(settings["age_decay"])
+
+        input_sources: List[InputSource] = [normalize_input_source(file_path) for file_path in selected_files]
+        if any(Path(file_path).suffix.lower() == ".zip" for file_path in selected_files):
+            zip_settings = ask_for_zip_import_settings(
+                self,
+                current_entry_type=self.zip_entry_type,
+                current_support_end_layer=self.zip_support_end_layer,
+            )
+            if zip_settings is None:
+                self.status_var.set("ZIP-Import abgebrochen. Keine Verarbeitung gestartet.")
+                self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
+                return
+
+            self.zip_entry_type = str(zip_settings["entry_type"])
+            self.zip_support_end_layer = int(zip_settings["support_end_layer"])
+
+            input_sources, source_errors = build_input_sources(
+                selected_files,
+                zip_entry_type=self.zip_entry_type,
+                zip_support_end_layer=self.zip_support_end_layer,
+            )
+            if source_errors:
+                messagebox.showwarning(
+                    "ZIP-Import",
+                    "Einige Eingaben konnten nicht aufgeloest werden:\n\n" + "\n\n".join(source_errors),
+                    parent=self,
+                )
+            if not input_sources:
+                self.status_var.set("Keine gueltigen Eingaben nach ZIP-Filter gefunden.")
+                self.progress_var.set("Bitte andere ZIP-Parameter oder Dateien waehlen.")
+                return
+
+        if self.mode in {"deterministic_grid_dispersion", "stochastic_grid_dispersion"}:
+            preview_items, preview_errors = build_grid_preview_data(input_sources)
+            if preview_errors:
+                messagebox.showwarning(
+                    "Grid-Vorschau",
+                    "Einige Dateien konnten fuer die Gittervorschau nicht geladen werden:\n\n"
+                    + "\n\n".join(preview_errors),
+                    parent=self,
+                )
+
+            preview_spacing = ask_for_grid_spread_preview(
+                self,
+                preview_items=preview_items,
+                current_grid_spacing=self.grid_spacing,
+            )
+            if preview_spacing is None:
+                self.status_var.set("Grid-Vorschau abgebrochen. Keine Verarbeitung gestartet.")
+                self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
+                return
+
+            self.grid_spacing = preview_spacing
+
+        self.start_processing(input_sources)
+
+    def _on_result_selected(self, _event: tk.Event) -> None:
+        """Update the visible file information when the selected result changes."""
+        if not self.results:
+            return
+
+        selected_name = self.file_var.get()
+        try:
+            index = [result.source_label for result in self.results].index(selected_name)
+        except ValueError:
+            return
+
+        self._load_result(index, start_playback=False)
+        self.status_var.set("Ergebnis ausgewaehlt. Interaktiven Viewer bei Bedarf oeffnen.")
+
+    def start_processing(self, input_sources: Sequence[Union[str, InputSource]]) -> None:
+        normalized_sources = [normalize_input_source(source) for source in input_sources]
+        self.selected_sources = tuple(normalized_sources)
+        self.process_cancel_event.clear()
+        self.animation_cancel_event.clear()
+        if self.queue_poll_job is not None:
+            self.after_cancel(self.queue_poll_job)
+            self.queue_poll_job = None
+        if self.loading_job is not None:
+            self.after_cancel(self.loading_job)
+            self.loading_job = None
+        if self.prepare_animation_job is not None:
+            self.after_cancel(self.prepare_animation_job)
+            self.prepare_animation_job = None
+        if self.animation_job is not None:
+            self.after_cancel(self.animation_job)
+            self.animation_job = None
+
+        self.total_files = len(normalized_sources)
+        self.completed_files = 0
+        self.results = []
+        self.errors = []
+        self.cancelled_files = []
+        self.result_map = {}
+        self.error_map = {}
+        self.cancelled_map = {}
+        self.file_progress_map = {index: 0.0 for index in range(1, self.total_files + 1)}
+        self.current_result = None
+        self.current_bounds = None
+        self.animation_plan = None
+        self.animation_frame_index = 0
+        self.animation_index = 0
+        self.animation_paused = False
+        self.pause_button_var.set("Play")
+        self.pending_animation_prepare = None
+        self.processing_active = True
+        self.processing_cancel_requested = False
+        self.animation_cancel_requested = False
+        self.zip_saved = False
+        self.current_progress_fraction = 0.0
+        self.loading_tick = 0
+        self.processing_started_at = time.perf_counter()
+        self.processing_total_seconds = 0.0
+        self.current_operation_started_at = self.processing_started_at
+        self.last_animation_prepare_seconds = 0.0
+        self.loading_message = (
+            f"Verarbeite {self.total_files} Datei(en)/Eintraege im Modus {get_mode_label(self.mode)} "
+            f"parallel auf bis zu {self.max_process_workers} Kernen"
+        )
+        self.worker_queue = queue.Queue()
+        self.view_zoom = 1.0
+
+        self.file_var.set("")
+        self.file_selector.config(values=[], state="disabled")
+        self.recalculate_button.config(state="disabled")
+        self.preview_button.config(state="disabled")
+        self.pause_button.config(state="disabled")
+        self.zip_button.config(state="disabled")
+        self._set_cancel_button_state(True)
+        self.progress_bar.config(mode="determinate", maximum=max(1, self.total_files), value=0.0)
+        self.progress_var.set(f"0 / {self.total_files} Dateien verarbeitet")
+        self.status_var.set("Verarbeitung gestartet.")
+        self._set_timer_text("Laufzeit", 0.0)
+        self._reset_preview("Dateien werden verarbeitet...")
+
+        for file_index, input_source in enumerate(normalized_sources, start=1):
+            file_name = input_source.source_label
+            self.worker_queue.put(("file_start", file_index, self.total_files, file_name))
+            future = self.process_pool.submit(
+                process_file_in_subprocess,
+                file_index,
+                self.total_files,
+                input_source,
+                self.w1,
+                self.w2,
+                self.memory,
+                self.mode,
+                self.process_progress_queue,
+                self.grid_spacing,
+                self.recent_percent,
+                self.age_decay,
+                self.process_cancel_event,
+            )
+            future.add_done_callback(
+                lambda done_future, current_index=file_index, total=self.total_files, current_source=input_source: self._enqueue_file_future_result(
+                    done_future,
+                    current_index,
+                    total,
+                    current_source,
+                )
+            )
+        self.queue_poll_job = self.after(80, self._poll_worker_queue)
+        self.loading_job = self.after(120, self._animate_loading)
+
+    def _poll_worker_queue(self) -> None:
+        self._drain_process_progress_queue()
+
+        while True:
+            try:
+                message = self.worker_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = message[0]
+
+            if kind == "file_start":
+                _, file_index, total_files, file_name = message
+                self.loading_message = f"Datei {file_index} / {total_files}: {file_name}"
+                self.current_progress_fraction = self.file_progress_map.get(file_index, 0.0)
+                self._update_progress_widgets()
+            elif kind == "file_future_done":
+                _, file_index, total_files, input_source, future = message
+                file_name = normalize_input_source(input_source).source_label
+                self.file_progress_map[file_index] = 1.0
+                try:
+                    _, _, _, result = future.result()
+                except Exception as exc:
+                    if is_cancelled_exception(exc):
+                        self.cancelled_map[file_index] = file_name
+                        self.loading_message = f"Datei {file_index} / {total_files}: {file_name} - abgebrochen"
+                    else:
+                        self.error_map[file_index] = f"{file_name}: {exc}"
+                        self.loading_message = f"Datei {file_index} / {total_files}: {file_name} - Fehler"
+                else:
+                    self.result_map[file_index] = result
+                    print_analysis_for_file(result)
+                    self.loading_message = f"Datei {file_index} / {total_files}: {file_name} abgeschlossen"
+
+                self.completed_files = len(self.result_map) + len(self.error_map) + len(self.cancelled_map)
+                self.current_progress_fraction = 0.0
+                self._update_progress_widgets()
+
+                if self.completed_files == self.total_files:
+                    self.results = [self.result_map[index] for index in sorted(self.result_map)]
+                    self.errors = [self.error_map[index] for index in sorted(self.error_map)]
+                    self.cancelled_files = [self.cancelled_map[index] for index in sorted(self.cancelled_map)]
+                    self.file_progress_map = {}
+                    self.processing_active = False
+                    self.processing_total_seconds = (
+                        0.0
+                        if self.processing_started_at is None
+                        else max(0.0, time.perf_counter() - self.processing_started_at)
+                    )
+                    self.processing_started_at = None
+                    self.current_operation_started_at = None
+                    self.process_cancel_event.clear()
+                    self.processing_cancel_requested = False
+                    self._set_cancel_button_state(False)
+                    self._finish_processing()
+            elif kind == "animation_future_done":
+                _, result_index, speed_multiplier, future = message
+                self.animation_future = None
+                self.animation_prepare_active = False
+                self.last_animation_prepare_seconds = (
+                    0.0
+                    if self.current_operation_started_at is None
+                    else max(0.0, time.perf_counter() - self.current_operation_started_at)
+                )
+                self.current_operation_started_at = None
+                self._set_cancel_button_state(False)
+
+                try:
+                    _, file_name, result_speed, plan = future.result()
+                except Exception as exc:
+                    self._show_animation_compute_button()
+                    self.file_selector.config(state="readonly")
+                    self.speed_slider.config(state="normal")
+                    self.trail_slider.config(state="normal")
+                    self.pause_button.config(state="disabled")
+                    if self.loading_job is not None:
+                        self.after_cancel(self.loading_job)
+                        self.loading_job = None
+                    if is_cancelled_exception(exc):
+                        self.status_var.set("Animationsvorbereitung abgebrochen.")
+                        self.progress_var.set("Animation nicht vorbereitet. Bitte erneut 'Animation berechnen' klicken.")
+                        self._set_timer_text("Vorbereitung", self.last_animation_prepare_seconds)
+                    else:
+                        messagebox.showerror("Animation", f"Animation konnte nicht vorbereitet werden:\n{exc}", parent=self)
+                        self.status_var.set("Fehler bei der Animationsvorbereitung.")
+                        self.progress_var.set(str(exc))
+                else:
+                    if (
+                        self.current_result is None
+                        or result_index >= len(self.results)
+                        or self.results[result_index].source_label != file_name
+                        or int(self.animation_speed_var.get()) != result_speed
+                    ):
+                        self.pending_animation_prepare = (result_index, int(self.animation_speed_var.get()))
+                    else:
+                        self.animation_plan = plan
+                        self.animation_ready = True
+                        self.animation_frame_index = 0
+                        self.animation_index = 0
+                        self.animation_progress_fraction = 0.0
+                        self._show_pause_button()
+                        self.pause_button_var.set("Pause")
+                        self.file_selector.config(state="readonly")
+                        self.speed_slider.config(state="normal")
+                        self.trail_slider.config(state="normal")
+                        if self.loading_job is not None:
+                            self.after_cancel(self.loading_job)
+                            self.loading_job = None
+                        self.progress_bar.config(maximum=1.0, value=1.0)
+                        self.progress_var.set(
+                            f"{plan.frame_count} Frames vorbereitet - {plan.points_per_second:.1f} Punkte/s bei {plan.fps:.0f} FPS"
+                        )
+                        self.status_var.set(f"Animation bereit fuer: {file_name}")
+                        self._set_timer_text("Vorbereitung", self.last_animation_prepare_seconds)
+                        self._load_result(result_index, start_playback=True)
+                self.animation_cancel_requested = False
+                self.animation_cancel_event.clear()
+
+            if (
+                not self.processing_active
+                and not self.animation_prepare_active
+                and self.pending_animation_prepare is not None
+                and self.animation_future is None
+            ):
+                next_index, _ = self.pending_animation_prepare
+                self.pending_animation_prepare = None
+                self._start_animation_prepare(next_index)
+                return
+
+        if self.processing_active or self.animation_prepare_active or self.animation_future is not None:
+            self.queue_poll_job = self.after(80, self._poll_worker_queue)
+        else:
+            self.queue_poll_job = None
+
+    def _animate_loading(self) -> None:
+        if not self.processing_active and not self.animation_prepare_active:
+            self.loading_job = None
+            return
+
+        frames = ["   ", ".  ", ".. ", "..."]
+        suffix = frames[self.loading_tick % len(frames)]
+        elapsed_seconds = 0.0
+        if self.current_operation_started_at is not None:
+            elapsed_seconds = time.perf_counter() - self.current_operation_started_at
+        self._set_timer_text("Laufzeit", elapsed_seconds)
+        status_suffix = " | Abbruch laeuft" if (self.processing_cancel_requested or self.animation_cancel_requested) else ""
+        self.status_var.set(f"{self.loading_message}{suffix}{status_suffix}")
+        self.loading_tick += 1
+        self.loading_job = self.after(160, self._animate_loading)
+
+    def _update_progress_widgets(self) -> None:
+        if self.processing_active:
+            total_value = sum(self.file_progress_map.values()) if self.file_progress_map else 0.0
+            self.progress_bar.config(maximum=max(1, self.total_files), value=min(total_value, self.total_files))
+            current_display = min(self.total_files, max(1, self.completed_files + 1))
+            percent = int(self.current_progress_fraction * 100)
+            cancelled_count = len(self.cancelled_map)
+            if self.processing_cancel_requested:
+                self.progress_var.set(
+                    f"Abbruch angefordert - {self.completed_files} / {self.total_files} abgeschlossen "
+                    f"({cancelled_count} abgebrochen)"
+                )
+            else:
+                self.progress_var.set(
+                    f"{self.completed_files} / {self.total_files} Dateien fertig - "
+                    f"aktive Datei {current_display} bei {percent}%"
+                )
+
+    def _finish_processing(self) -> None:
+        if self.loading_job is not None:
+            self.after_cancel(self.loading_job)
+            self.loading_job = None
+        self.progress_bar.config(value=len(self.results) + len(self.errors) + len(self.cancelled_files))
+        self._set_cancel_button_state(False)
+        self.recalculate_button.config(state="normal" if self.selected_input_files else "disabled")
+        self.status_var.set("Verarbeitung abgeschlossen.")
+        self._set_timer_text("Gesamtzeit", self.processing_total_seconds)
+
+        if self.errors:
+            messagebox.showwarning(
+                "Einige Dateien konnten nicht verarbeitet werden",
+                "\n\n".join(self.errors),
+                parent=self,
+            )
+
+        if not self.results:
+            if self.cancelled_files and not self.errors:
+                self.status_var.set("Verarbeitung abgebrochen.")
+                self.progress_var.set(
+                    f"Keine Datei abgeschlossen. Gesamtzeit: {format_duration(self.processing_total_seconds, include_tenths=True)}"
+                )
+            else:
+                self.status_var.set("Keine Datei konnte verarbeitet werden.")
+                self.progress_var.set("Bitte waehlen Sie andere Dateien aus.")
+            self._reset_preview("Keine gueltigen Ergebnisse vorhanden.")
+            return
+
+        file_names = [result.source_label for result in self.results]
+        self.file_selector.config(values=file_names, state="readonly")
+        self.zip_button.config(state="normal")
+        self.file_var.set(file_names[0])
+        self._show_animation_compute_button()
+        self.pause_button.config(state="disabled")
+        self.last_confirmed_speed = int(self.animation_speed_var.get())
+        self.last_confirmed_trail = int(self.trail_count_var.get())
+
+        summary_lines = [
+            f"Gesamtzeit: {format_duration(self.processing_total_seconds, include_tenths=True)}",
+            f"Erfolgreich: {len(self.results)} | Fehler: {len(self.errors)} | Abgebrochen: {len(self.cancelled_files)}",
+        ]
+        summary_lines.extend(
+            f"{result.source_label}: {format_duration(result.processing_seconds, include_tenths=True)}"
+            for result in self.results
+        )
+        self.status_var.set("Verarbeitung abgeschlossen. Bitte Ergebnis pruefen oder Viewer oeffnen.")
+        self.progress_var.set("\n".join(summary_lines))
+        self._load_result(0, start_playback=False)
+        self.status_var.set("Ergebnis geladen. Interaktiven Viewer bei Bedarf oeffnen.")
+
+    def _build_viewer_payload(self, selected_index: int) -> Dict[str, Any]:
+        """Serialize the current results into a payload consumed by the standalone viewer."""
+        return {
+            "app_name": APP_DISPLAY_NAME,
+            "mode_id": normalize_mode(self.mode),
+            "mode_label": get_mode_label(self.mode),
+            "mode_description": get_mode_spec(self.mode).description,
+            "selected_index": selected_index,
+            "results": [
+                {
+                    "source_label": result.source_label,
+                    "source_path": str(result.source_path),
+                    "archive_member": result.archive_member,
+                    "output_name": result.output_name,
+                    "point_count": len(result.original_points),
+                    "original_points": [[point[0], point[1]] for point in result.original_points],
+                    "optimized_points": [[point[0], point[1]] for point in result.optimized_points],
+                }
+                for result in self.results
+            ],
+        }
+
+    def _open_interactive_viewer(self) -> None:
+        """Launch the separate Qt/PyQtGraph viewer for the currently processed results."""
+        if not self.results:
+            messagebox.showinfo(APP_DISPLAY_NAME, "Es gibt noch keine Ergebnisse fuer den Viewer.", parent=self)
+            return
+
+        selected_name = self.file_var.get() or self.results[0].source_label
+        try:
+            selected_index = [result.source_label for result in self.results].index(selected_name)
+        except ValueError:
+            selected_index = 0
+
+        payload = self._build_viewer_payload(selected_index)
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                suffix=".json",
+                prefix=VIEWER_PAYLOAD_PREFIX,
+                delete=False,
+            ) as handle:
+                json.dump(payload, handle)
+                payload_path = handle.name
+        except Exception as exc:
+            messagebox.showerror(APP_DISPLAY_NAME, f"Viewer-Payload konnte nicht erstellt werden:\n{exc}", parent=self)
+            return
+
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--viewer-payload", payload_path]
+        else:
+            command = [sys.executable, str(Path(__file__).resolve()), "--viewer-payload", payload_path]
+
+        try:
+            viewer_process = subprocess.Popen(command, cwd=str(Path(__file__).resolve().parent))
+        except Exception as exc:
+            messagebox.showerror(
+                APP_DISPLAY_NAME,
+                (
+                    "Der interaktive Viewer konnte nicht gestartet werden.\n\n"
+                    "Bitte pruefen Sie, ob PySide6, pyqtgraph und numpy installiert sind.\n\n"
+                    f"Technischer Hinweis:\n{exc}"
+                ),
+                parent=self,
+            )
+            try:
+                Path(payload_path).unlink()
+            except OSError:
+                pass
+            return
+
+        self.viewer_processes.append(viewer_process)
+        self.status_var.set(f"Interaktiver Viewer gestartet fuer: {self.results[selected_index].source_label}")
+
+    def _show_selected_animation(self) -> None:
+        self._open_interactive_viewer()
+
+    def _toggle_pause(self) -> None:
+        """Pause or resume the already prepared animation."""
+        if self.animation_plan is None:
+            return
+
+        self.animation_paused = not self.animation_paused
+        if self.animation_paused:
+            if self.animation_job is not None:
+                self.after_cancel(self.animation_job)
+                self.animation_job = None
+            self.pause_button_var.set("Play")
+            self.status_var.set("Animation pausiert.")
+        else:
+            self.pause_button_var.set("Pause")
+            if self.current_result is not None:
+                if self.animation_plan is not None:
+                    self.status_var.set(
+                        f"Animation aktiv fuer: {self.current_result.source_label} - {self.animation_plan.fps:.0f} FPS"
+                    )
+                else:
+                    self.status_var.set(f"Animation aktiv fuer: {self.current_result.source_label}")
+            self._restart_animation()
+
+    def _start_animation_prepare(self, index: int) -> None:
+        """Prepare the full animation timeline in a separate process before playback."""
+        if self.processing_active:
+            return
+
+        if self.prepare_animation_job is not None:
+            self.after_cancel(self.prepare_animation_job)
+            self.prepare_animation_job = None
+
+        if self.animation_job is not None:
+            self.after_cancel(self.animation_job)
+            self.animation_job = None
+
+        self.current_result = self.results[index]
+        self.current_bounds = compute_bounds(self.current_result)
+        self.animation_plan = None
+        self.animation_ready = False
+        self.animation_frame_index = 0
+        self.animation_index = 0
+        self.animation_paused = False
+        self.pause_button_var.set("Play")
+        self.file_var.set(self.current_result.source_label)
+        self.animation_prepare_active = True
+        self.animation_cancel_requested = False
+        self.animation_cancel_event.clear()
+        self.pending_animation_prepare = None
+        self.current_progress_fraction = 0.0
+        self.animation_progress_fraction = 0.0
+        self.loading_tick = 0
+        self.current_operation_started_at = time.perf_counter()
+        self.last_animation_prepare_seconds = 0.0
+        self.loading_message = f"Berechne Animation: {self.current_result.source_label}"
+
+        self.preview_button.config(state="disabled")
+        self.pause_button.config(state="disabled")
+        self.file_selector.config(state="disabled")
+        self.speed_slider.config(state="disabled")
+        self.trail_slider.config(state="disabled")
+        self._set_cancel_button_state(True)
+        self.progress_bar.config(mode="determinate", maximum=1.0, value=0.0)
+        self.progress_var.set("Animationsdaten werden vorbereitet")
+        self.status_var.set("Animation wird vorbereitet")
+        self._set_timer_text("Laufzeit", 0.0)
+        self._prepare_canvas_view(self.original_panel.canvas, self.current_result.original_points)
+        self._prepare_canvas_view(self.optimized_panel.canvas, self.current_result.optimized_points)
+        self._draw_current_frame()
+
+        if self.loading_job is not None:
+            self.after_cancel(self.loading_job)
+        self.loading_job = self.after(120, self._animate_loading)
+
+        selected_index = index
+        selected_speed = int(self.animation_speed_var.get())
+        self.animation_future = self.process_pool.submit(
+            build_animation_plan_in_subprocess,
+            selected_index,
+            self.current_result.source_label,
+            len(self.current_result.original_points),
+            selected_speed,
+            self.process_progress_queue,
+            self.animation_cancel_event,
+        )
+        self.animation_future.add_done_callback(
+            lambda done_future, result_idx=selected_index, speed_value=selected_speed: self._enqueue_animation_future_result(
+                done_future,
+                result_idx,
+                speed_value,
+            )
+        )
+        if self.queue_poll_job is None:
+            self.queue_poll_job = self.after(80, self._poll_worker_queue)
+
+    def _load_result(self, index: int, start_playback: bool = False) -> None:
+        self.current_result = self.results[index]
+        self.current_bounds = compute_bounds(self.current_result)
+        self.animation_frame_index = 0
+        self.animation_index = 0
+        self.animation_paused = False
+        self.pause_button_var.set("Play")
+
+        self.file_var.set(self.current_result.source_label)
+        source_lines = [f"Quelle: {self.current_result.source_path}"]
+        if self.current_result.archive_member is not None:
+            source_lines = [
+                f"Archiv: {self.current_result.source_path}",
+                f"Eintrag: {self.current_result.archive_member}",
+            ]
+        mode_spec = get_mode_spec(self.mode)
+        parameter_lines: List[str] = []
+        if MODE_PARAMETER_MEMORY in mode_spec.visible_parameters:
+            parameter_lines.append(f"Memory: {self.memory}")
+        if MODE_PARAMETER_GRID_SPACING in mode_spec.visible_parameters:
+            parameter_lines.append(f"Grid spacing: {self.grid_spacing:.6g}")
+        if MODE_PARAMETER_RECENT_PERCENT in mode_spec.visible_parameters:
+            parameter_lines.append(f"Recent set: {self.recent_percent:.1f}%")
+            parameter_lines.append(f"Age decay (fixed): {self.age_decay:.2f}")
+        if not parameter_lines:
+            parameter_lines.append("Zusaetzliche Parameter: keine")
+
+        current_zip_name = build_default_zip_name([self.current_result], self.mode)
+        viewer_hint = "Interaktiver Viewer: separates Qt/PyQtGraph-Fenster fuer Zoom, Panning und Animation."
+        self.file_info_label.config(
+            text=(
+                "\n".join(source_lines)
+                + "\n"
+                + f"Anzeige: {self.current_result.source_label}\n"
+                f"Exportname im Ergebnis-ZIP: {self.current_result.output_name}\n"
+                f"Vorgeschlagener ZIP-Name: {current_zip_name}\n"
+                f"Punkte: {len(self.current_result.original_points)}\n"
+                f"Berechnungszeit: {format_duration(self.current_result.processing_seconds, include_tenths=True)}\n"
+                f"Modus: {mode_spec.label}\n"
+                + "\n".join(parameter_lines)
+                + "\n"
+                + f"Beschreibung: {mode_spec.description}\n"
+                + viewer_hint
+            )
+        )
+        self.original_stats_label.config(text="Original\n--------\n" + format_stats(self.current_result.original_stats))
+        self.optimized_stats_label.config(text="Optimised\n---------\n" + format_stats(self.current_result.optimized_stats))
+
+        self.status_var.set(f"Ergebnis aktiv: {self.current_result.source_label}")
+        self.preview_button.config(state="normal")
+        self.pause_button.config(state="disabled")
+
+    def _restart_animation(self) -> None:
+        if self.animation_job is not None:
+            self.after_cancel(self.animation_job)
+            self.animation_job = None
+        if self.animation_plan is None or self.animation_paused:
+            return
+        _, _, _, interval_ms = self._get_animation_timing()
+        self.animation_job = self.after(interval_ms, self._animation_step)
+
+    def _animation_step(self) -> None:
+        if self.current_result is None or self.animation_plan is None:
+            return
+
+        point_count = len(self.current_result.original_points)
+        if point_count == 0:
+            return
+
+        _, _, _, interval_ms = self._get_animation_timing()
+        self.animation_frame_index = (self.animation_frame_index + 1) % self.animation_plan.frame_count
+        current_progress = self.animation_plan.progress_values[self.animation_frame_index]
+        self.animation_index = min(int(current_progress), point_count - 1)
+        self._draw_current_frame()
+        if not self.animation_paused:
+            self.animation_job = self.after(interval_ms, self._animation_step)
+
+    def _draw_current_frame(self) -> None:
+        if self.current_result is None:
+            return
+
+        current_progress = 0.0
+        if self.animation_plan is not None and self.animation_plan.frame_count > 0:
+            current_progress = self.animation_plan.progress_values[self.animation_frame_index]
+
+        self.original_label_var.set(
+            f"Punkt {min(int(current_progress) + 1, max(1, len(self.current_result.original_points)))} / "
+            f"{len(self.current_result.original_points)}"
+        )
+        self.optimized_label_var.set(
+            f"Punkt {min(int(current_progress) + 1, max(1, len(self.current_result.optimized_points)))} / "
+            f"{len(self.current_result.optimized_points)}"
+        )
+
+    def _map_point(self, point: Point, width: int, height: int) -> Tuple[float, float]:
+        assert self.current_bounds is not None
+        min_x, max_x, min_y, max_y = self.current_bounds
+        span_x = max(max_x - min_x, 1e-12)
+        span_y = max(max_y - min_y, 1e-12)
+        margin = max(8.0, min(width, height) * 0.02)
+
+        scale = min((width - margin * 2) / span_x, (height - margin * 2) / span_y) * self.view_zoom
+        content_width = span_x * scale
+        content_height = span_y * scale
+
+        offset_x = (width - content_width) / 2
+        offset_y = (height - content_height) / 2
+
+        x = offset_x + (point[0] - min_x) * scale
+        y = height - (offset_y + (point[1] - min_y) * scale)
+        return (x, y)
+
+    def _reset_preview(self, message: str) -> None:
+        self.current_result = None
+        self.current_bounds = None
+        self.view_zoom = 1.0
+        self.animation_plan = None
+        self.animation_ready = False
+        self.animation_frame_index = 0
+        self.animation_index = 0
+        self.animation_paused = False
+        self.pause_button_var.set("Play")
+        self.original_label_var.set("Punkt 0 / 0")
+        self.optimized_label_var.set("Punkt 0 / 0")
+        self.pause_button.config(state="disabled")
+        self.preview_button.config(state="normal" if self.results else "disabled")
+        self.trail_slider.config(to=TRAIL_MAX_POINTS)
+        self.file_info_label.config(text=message)
+        self.original_stats_label.config(text="Original\n--------\nNoch keine Datei aktiv.")
+        self.optimized_stats_label.config(text="Optimised\n---------\nNoch keine Datei aktiv.")
+
+    def _draw_placeholder(self, canvas: tk.Canvas, message: str) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), int(canvas["width"]))
+        height = max(canvas.winfo_height(), int(canvas["height"]))
+        canvas.create_rectangle(0, 0, width, height, fill="#000000", outline="")
+        canvas.create_text(
+            width / 2,
+            height / 2,
+            text=message,
+            fill="#8a8a8a",
+            font=("Segoe UI", 13),
+            width=max(320, width - 80),
+            justify="center",
+        )
+    def _get_trail_colors(self, count: int) -> List[str]:
+        """Return a cached list of gradient colors for the requested bin count."""
+        safe_count = max(1, int(count))
+        colors = self.trail_color_cache.get(safe_count)
+        if colors is None:
+            colors = build_trail_colors(safe_count)
+            self.trail_color_cache[safe_count] = colors
+        return colors
+
+    def _put_photo_square(
+        self,
+        photo: tk.PhotoImage,
+        x_pos: int,
+        y_pos: int,
+        color: str,
+        half_size: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Paint one small filled square into a PhotoImage."""
+        left = max(0, x_pos - half_size)
+        top = max(0, y_pos - half_size)
+        right = min(width, x_pos + half_size + 1)
+        bottom = min(height, y_pos + half_size + 1)
+        if left >= right or top >= bottom:
+            return
+        photo.put(color, to=(left, top, right, bottom))
+
+    def _paint_point_range(
+        self,
+        canvas: tk.Canvas,
+        start_index: int,
+        end_index: int,
+        color: str,
+        half_size: int,
+    ) -> None:
+        """Paint a contiguous point range into the canvas raster layer."""
+        if end_index < start_index:
+            return
+
+        photo: Optional[tk.PhotoImage] = getattr(canvas, "render_photo", None)
+        cached_points: List[Tuple[int, int]] = getattr(canvas, "cached_points", [])
+        width = getattr(canvas, "cached_width", 0)
+        height = getattr(canvas, "cached_height", 0)
+
+        if photo is None or not cached_points or width <= 0 or height <= 0:
+            return
+
+        max_index = min(end_index, len(cached_points) - 1)
+        for point_index in range(max(start_index, 0), max_index + 1):
+            x_pos, y_pos = cached_points[point_index]
+            self._put_photo_square(photo, x_pos, y_pos, color, half_size, width, height)
+
+    def _reset_canvas_raster(self, canvas: tk.Canvas) -> None:
+        """Reset one canvas to the base image with all points as dark background dots."""
+        photo: Optional[tk.PhotoImage] = getattr(canvas, "render_photo", None)
+        cached_points: List[Tuple[int, int]] = getattr(canvas, "cached_points", [])
+        width = getattr(canvas, "cached_width", 0)
+        height = getattr(canvas, "cached_height", 0)
+
+        if photo is None or width <= 0 or height <= 0:
+            return
+
+        photo.blank()
+        photo.put("#000000", to=(0, 0, width, height))
+        for x_pos, y_pos in cached_points:
+            self._put_photo_square(
+                photo,
+                x_pos,
+                y_pos,
+                "#1b1b1b",
+                BACKGROUND_POINT_HALF_SIZE,
+                width,
+                height,
+            )
+
+        canvas.last_base_index = -1
+        canvas.last_gray_limit = -1
+        canvas.last_gradient_ranges = []
+        canvas.last_gradient_bin_count = 0
+        canvas.last_trail_count = int(self.trail_count_var.get())
+        head_item = getattr(canvas, "head_item", None)
+        if head_item is not None:
+            canvas.itemconfigure(head_item, state="hidden")
+
+    def _draw_canvas_state_from_scratch(self, canvas: tk.Canvas, base_index: int, trail_count: int) -> None:
+        """Rebuild the visible canvas state for the current animation position."""
+        self._reset_canvas_raster(canvas)
+
+        if base_index < 0:
+            return
+
+        gray_limit = max(-1, base_index - trail_count)
+        if gray_limit >= 0:
+            self._paint_point_range(canvas, 0, gray_limit, "#666666", VISITED_POINT_HALF_SIZE)
+
+        gradient_start = max(0, base_index - trail_count + 1)
+        gradient_count = base_index - gradient_start + 1
+        gradient_bin_count = min(MAX_RENDER_GRADIENT_BINS, trail_count, gradient_count)
+        gradient_ranges = build_gradient_bin_ranges(gradient_start, base_index, gradient_bin_count)
+        gradient_colors = self._get_trail_colors(gradient_bin_count)
+
+        for range_index, point_range in enumerate(gradient_ranges):
+            self._paint_point_range(
+                canvas,
+                point_range[0],
+                point_range[1],
+                gradient_colors[range_index],
+                VISITED_POINT_HALF_SIZE,
+            )
+
+        canvas.last_base_index = base_index
+        canvas.last_gray_limit = gray_limit
+        canvas.last_gradient_ranges = gradient_ranges
+        canvas.last_gradient_bin_count = gradient_bin_count
+        canvas.last_trail_count = trail_count
+
+    def _update_canvas_raster_state(self, canvas: tk.Canvas, base_index: int, trail_count: int) -> None:
+        """Update only the changed raster regions for the current animation step."""
+        cached_points: List[Tuple[int, int]] = getattr(canvas, "cached_points", [])
+        if not cached_points:
+            return
+
+        point_count = len(cached_points)
+        safe_base_index = min(max(base_index, 0), point_count - 1)
+        safe_trail_count = max(TRAIL_MIN_POINTS, min(int(trail_count), point_count))
+
+        last_base_index = getattr(canvas, "last_base_index", -1)
+        last_trail_count = getattr(canvas, "last_trail_count", safe_trail_count)
+        last_gradient_bin_count = getattr(canvas, "last_gradient_bin_count", 0)
+
+        gradient_start = max(0, safe_base_index - safe_trail_count + 1)
+        gradient_count = safe_base_index - gradient_start + 1
+        gradient_bin_count = min(MAX_RENDER_GRADIENT_BINS, safe_trail_count, gradient_count)
+
+        if (
+            safe_base_index < last_base_index
+            or safe_trail_count != last_trail_count
+            or gradient_bin_count != last_gradient_bin_count
+        ):
+            self._draw_canvas_state_from_scratch(canvas, safe_base_index, safe_trail_count)
+            return
+
+        if safe_base_index == last_base_index:
+            return
+
+        new_gray_limit = max(-1, safe_base_index - safe_trail_count)
+        last_gray_limit = getattr(canvas, "last_gray_limit", -1)
+        if new_gray_limit > last_gray_limit:
+            self._paint_point_range(
+                canvas,
+                last_gray_limit + 1,
+                new_gray_limit,
+                "#666666",
+                VISITED_POINT_HALF_SIZE,
+            )
+
+        new_gradient_ranges = build_gradient_bin_ranges(gradient_start, safe_base_index, gradient_bin_count)
+        old_gradient_ranges: List[Tuple[int, int]] = getattr(canvas, "last_gradient_ranges", [])
+        gradient_colors = self._get_trail_colors(gradient_bin_count)
+
+        for range_index, new_range in enumerate(new_gradient_ranges):
+            old_range = old_gradient_ranges[range_index] if range_index < len(old_gradient_ranges) else None
+            for update_range in inclusive_range_difference(new_range, old_range):
+                self._paint_point_range(
+                    canvas,
+                    update_range[0],
+                    update_range[1],
+                    gradient_colors[range_index],
+                    VISITED_POINT_HALF_SIZE,
+                )
+
+        canvas.last_base_index = safe_base_index
+        canvas.last_gray_limit = new_gray_limit
+        canvas.last_gradient_ranges = new_gradient_ranges
+        canvas.last_gradient_bin_count = gradient_bin_count
+        canvas.last_trail_count = safe_trail_count
+
+    def _prepare_canvas_view(self, canvas: tk.Canvas, points: List[Point]) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), int(canvas["width"]))
+        height = max(canvas.winfo_height(), int(canvas["height"]))
+
+        if not points or self.current_bounds is None:
+            self._draw_placeholder(canvas, "Keine Punkte vorhanden.")
+            canvas.cached_points = []
+            canvas.render_photo = None
+            canvas.head_item = None
+            canvas.last_base_index = -1
+            canvas.last_gray_limit = -1
+            canvas.last_gradient_ranges = []
+            canvas.last_gradient_bin_count = 0
+            canvas.last_trail_count = int(self.trail_count_var.get())
+            return
+
+        cached_points = [
+            (int(round(mapped_x)), int(round(mapped_y)))
+            for mapped_x, mapped_y in (self._map_point(point, width, height) for point in points)
+        ]
+        canvas.cached_points = cached_points
+        canvas.cached_width = width
+        canvas.cached_height = height
+        canvas.render_photo = tk.PhotoImage(width=width, height=height)
+        canvas.image_item = canvas.create_image(0, 0, anchor="nw", image=canvas.render_photo)
+        canvas.head_item = canvas.create_oval(0, 0, 0, 0, fill="#ff1010", outline="", state="hidden")
+        canvas.last_base_index = -1
+        canvas.last_gray_limit = -1
+        canvas.last_gradient_ranges = []
+        canvas.last_gradient_bin_count = 0
+        canvas.last_trail_count = int(self.trail_count_var.get())
+        self._reset_canvas_raster(canvas)
+
+    def _update_canvas_animation(
+        self,
+        canvas: tk.Canvas,
+        current_progress: float,
+        label_var: tk.StringVar,
+    ) -> None:
+        cached_points: List[Tuple[float, float]] = getattr(canvas, "cached_points", [])
+        head_item = getattr(canvas, "head_item", None)
+
+        if not cached_points or head_item is None:
+            label_var.set("Punkt 0 / 0")
+            return
+
+        point_count = len(cached_points)
+        base_index = min(max(int(current_progress), 0), point_count - 1)
+        next_index = min(base_index + 1, point_count - 1)
+        segment_fraction = max(0.0, min(1.0, current_progress - base_index))
+        start_x, start_y = cached_points[base_index]
+        end_x, end_y = cached_points[next_index]
+        head_x = start_x + (end_x - start_x) * segment_fraction
+        head_y = start_y + (end_y - start_y) * segment_fraction
+
+        trail_count = max(TRAIL_MIN_POINTS, min(int(self.trail_count_var.get()), point_count))
+        self._update_canvas_raster_state(canvas, base_index, trail_count)
+        canvas.coords(
+            head_item,
+            head_x - HEAD_POINT_RADIUS,
+            head_y - HEAD_POINT_RADIUS,
+            head_x + HEAD_POINT_RADIUS,
+            head_y + HEAD_POINT_RADIUS,
+        )
+        canvas.itemconfigure(head_item, state="normal")
+
+        label_var.set(f"Punkt {base_index + 1} / {len(cached_points)}")
+
+
+    def _save_zip(self) -> bool:
+        if not self.results:
+            messagebox.showinfo("ZIP speichern", "Es gibt noch keine verarbeiteten Dateien.", parent=self)
+            return False
+
+        zip_path = ask_for_zip_path(self, build_default_zip_name(self.results, self.mode))
+        if not zip_path:
+            return False
+
+        try:
+            save_results_as_zip(self.results, zip_path)
+        except Exception as exc:
+            messagebox.showerror("Speicherfehler", f"ZIP-Datei konnte nicht gespeichert werden:\n{exc}", parent=self)
+            return False
+
+        self.zip_saved = True
+        self.status_var.set(f"ZIP gespeichert: {zip_path}")
+        messagebox.showinfo("Fertig", f"ZIP-Datei gespeichert:\n{zip_path}", parent=self)
+        return True
+
+    def _handle_close(self) -> None:
+        if self.processing_active or self.animation_prepare_active:
+            answer = messagebox.askyesno(
+                "Vorgang abbrechen",
+                "Es laeuft noch eine Verarbeitung oder Animationsvorbereitung. Moechten Sie das Programm wirklich schliessen?",
+                parent=self,
+            )
+            if not answer:
+                return
+            self.process_cancel_event.set()
+            self.animation_cancel_event.set()
+
+        if self.results and not self.zip_saved:
+            answer = messagebox.askyesnocancel(
+                "ZIP speichern",
+                "Moechten Sie vor dem Schliessen alle optimierten Dateien als ZIP speichern?",
+                parent=self,
+            )
+            if answer is None:
+                return
+            if answer and not self._save_zip():
+                return
+
+        if self.queue_poll_job is not None:
+            self.after_cancel(self.queue_poll_job)
+            self.queue_poll_job = None
+        if self.loading_job is not None:
+            self.after_cancel(self.loading_job)
+            self.loading_job = None
+        if self.prepare_animation_job is not None:
+            self.after_cancel(self.prepare_animation_job)
+            self.prepare_animation_job = None
+        if self.resize_refresh_job is not None:
+            self.after_cancel(self.resize_refresh_job)
+            self.resize_refresh_job = None
+        if self.animation_job is not None:
+            self.after_cancel(self.animation_job)
+            self.animation_job = None
+        try:
+            self.process_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        try:
+            self.mp_manager.shutdown()
+        except Exception:
+            pass
+        self.destroy()
+
+
+def run_self_tests() -> None:
+    """Run small assert-based tests before the real program starts."""
+    assert _parse_abs_line("ABS 0.14821933333333334 -0.23783766666666667") == (
+        0.14821933333333334,
+        -0.23783766666666667,
+    )
+    assert _parse_abs_line("# Kommentar") is None
+    assert _parse_abs_line("HEADER irgendwas") is None
+    assert normalize_mode("basic") == "local_greedy"
+    assert normalize_mode("greedy") == "local_greedy"
+    assert normalize_mode("random_noise") == "density_adaptive_sampling"
+    assert get_mode_label("spread") == "Dispersion Maximisation"
+    assert build_output_name_for_source(
+        InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
+        "local_greedy",
+    ) == "sample_abs_input_optimised_local_greedy.txt"
+    assert parse_b99_archive_entry_name("12021.B99") == (12, "infill")
+    assert parse_b99_archive_entry_name("12031.B99") == (12, "boundary")
+    assert parse_b99_archive_entry_name("12091.B99") == (12, "combo")
+    assert set(select_bucket_candidates(list(range(10)), candidate_limit=4, randomized=False)) == {0, 1, 2, 3}
+    seeded_candidates = select_bucket_candidates(
+        list(range(10)),
+        candidate_limit=4,
+        randomized=True,
+        rng=random.Random(123),
+    )
+    assert len(seeded_candidates) == 4
+    assert len(set(seeded_candidates)) == 4
+    assert set(seeded_candidates).issubset(set(range(10)))
+    assert len(sample_points_for_preview([(float(index), 0.0) for index in range(100)], max_points=10)) <= 11
+    assert compute_point_bounds([(0.0, 1.0), (2.0, 3.0), (-1.0, 4.0)]) == (-1.0, 2.0, 1.0, 4.0)
+
+    stats = analyze_path([(0.0, 0.0), (3.0, 4.0), (6.0, 8.0)])
+    assert math.isclose(stats["mean_jump"], 5.0, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(stats["max_jump"], 5.0, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(stats["min_jump"], 5.0, rel_tol=0.0, abs_tol=1e-12)
+    assert int(stats["count_jumps"]) == 2
+    assert format_duration(65.4, include_tenths=True) == "00:01:05.4"
+
+    plan = build_animation_plan(point_count=10, speed_multiplier=1)
+    assert plan.frame_count > 1
+    assert math.isclose(plan.fps, 30.0, rel_tol=0.0, abs_tol=1e-12)
+    assert plan.progress_values[0] == 0.0
+    assert plan.progress_values[-1] >= 9.0
+
+    _, _, _, worker_plan = build_animation_plan_in_subprocess(0, "sample.txt", 10, 1, None)
+    assert worker_plan.frame_count == plan.frame_count
+
+    colors = build_trail_colors(4)
+    assert len(colors) == 4
+    assert colors[0] == "#ffffff"
+    assert colors[-1] == "#ff1010"
+    assert build_gradient_bin_ranges(0, 9, 4) == [(0, 1), (2, 4), (5, 6), (7, 9)]
+    assert inclusive_range_difference((3, 7), (1, 4)) == [(5, 7)]
+    assert inclusive_range_difference((3, 7), None) == [(3, 7)]
+
+    grid_spread_points = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.1, 0.1)]
+    grid_spread_result = optimize_path(
+        grid_spread_points,
+        mode="grid_spread",
+        grid_spacing=1.0,
+        recent_percent=50.0,
+        age_decay=0.9,
+    )
+    assert set(grid_spread_result[:4]) == {(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)}
+    assert grid_spread_result[-1] == (0.1, 0.1)
+    assert sorted(grid_spread_result) == sorted(grid_spread_points)
+    assert grid_spread_points == [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.1, 0.1)]
+    random_grid_result = optimize_path(
+        grid_spread_points,
+        mode="random_grid",
+        grid_spacing=1.0,
+        recent_percent=50.0,
+        age_decay=0.9,
+    )
+    assert sorted(random_grid_result) == sorted(grid_spread_points)
+    random_noise_result = optimize_path(
+        grid_spread_points,
+        mode="random_noise",
+    )
+    assert len(random_noise_result) == len(grid_spread_points)
+    assert sorted(random_noise_result) == sorted(grid_spread_points)
+
+    test_root = Path(__file__).resolve().parent
+    input_path = test_root / "_selftest_sample_abs.txt"
+    archive_input_path = test_root / "_selftest_archive.zip"
+    output_path = test_root / "_selftest_output.txt"
+    zip_path = test_root / "_selftest_output.zip"
+
+    try:
+        with open(input_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("# Header bleibt erhalten\n")
+            handle.write("ABS 0.0 0.0\n")
+            handle.write("Kommentarzeile\n")
+            handle.write("ABS 1.0 0.0\n")
+            handle.write("ABS 1.0 1.0\n")
+
+        lines, points = load_points_from_file(str(input_path))
+        assert len(lines) == 5
+        assert points == [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+
+        preview_items, preview_errors = build_grid_preview_data([str(input_path)], max_points_per_file=2)
+        assert not preview_errors
+        assert len(preview_items) == 1
+        assert preview_items[0].point_count == 3
+        assert len(preview_items[0].sampled_points) <= 3
+
+        with zipfile.ZipFile(archive_input_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("inner/01021.B99", "ABS 0.0 0.0\nABS 1.0 1.0\n")
+            archive.writestr("inner/02031.B99", "ABS 2.0 2.0\nABS 3.0 3.0\n")
+            archive.writestr("inner/00021.B99", "ABS 9.0 9.0\n")
+            archive.writestr("inner/readme.txt", "ignored\n")
+
+        input_sources, source_errors = build_input_sources(
+            [str(archive_input_path)],
+            zip_entry_type="infill",
+            zip_support_end_layer=0,
+        )
+        assert not source_errors
+        assert len(input_sources) == 1
+        assert input_sources[0].archive_member == "inner/01021.B99"
+        assert input_sources[0].output_name == "inner/01021.B99"
+        assert build_output_name_for_source(input_sources[0], "stochastic_grid_dispersion") == (
+            "inner/01021_optimised_stochastic_grid_dispersion.B99"
+        )
+        zip_lines, zip_points = load_points_from_input_source(input_sources[0])
+        assert len(zip_lines) == 2
+        assert zip_points == [(0.0, 0.0), (1.0, 1.0)]
+
+        _, _, _, worker_result = process_file_in_subprocess(
+            1,
+            1,
+            str(input_path),
+            W1_DEFAULT,
+            W2_DEFAULT,
+            MEMORY_DEFAULT,
+            "basic",
+            None,
+        )
+        assert worker_result.output_name == "_selftest_sample_abs_optimised_local_greedy.txt"
+
+        save_points(lines, points, str(output_path))
+        assert output_path.is_file()
+
+        result = ProcessedFileResult(
+            source_path=input_path,
+            source_label=input_path.name,
+            archive_member=None,
+            output_name=input_path.name,
+            original_lines=lines,
+            original_points=points,
+            optimized_points=points,
+            original_stats=analyze_path(points),
+            optimized_stats=analyze_path(points),
+            output_text=build_output_text(lines, points),
+            processing_seconds=0.123,
+        )
+        save_results_as_zip([result], str(zip_path))
+        assert zip_path.is_file()
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            assert input_path.name in archive.namelist()
+
+        processed_zip_result = process_file(
+            input_sources[0],
+            w1=W1_DEFAULT,
+            w2=W2_DEFAULT,
+            memory=MEMORY_DEFAULT,
+            mode="basic",
+        )
+        save_results_as_zip([processed_zip_result], str(zip_path))
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            assert set(archive.namelist()) == {
+                "inner/01021_optimised_local_greedy.B99",
+                "inner/02031.B99",
+                "inner/00021.B99",
+                "inner/readme.txt",
+            }
+            optimized_member = archive.read("inner/01021_optimised_local_greedy.B99").decode("utf-8")
+            untouched_member = archive.read("inner/02031.B99").decode("utf-8")
+            assert optimized_member == processed_zip_result.output_text
+            assert untouched_member == "ABS 2.0 2.0\nABS 3.0 3.0\n"
+        assert build_default_zip_name([worker_result], "local_greedy") == "_selftest_sample_abs_optimised_local_greedy.zip"
+    finally:
+        for path in (input_path, archive_input_path, output_path, zip_path):
+            if path.exists():
+                path.unlink()
+
+
+def main() -> None:
+    mp.freeze_support()
+    allowed_modes = OPTIMIZATION_MODES + tuple(MODE_ALIASES)
+    canonical_mode_help = ", ".join(
+        f"{mode_id} ({MODE_SPECS[mode_id].label})"
+        for mode_id in OPTIMIZATION_MODES
+    )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            f"{APP_DISPLAY_NAME}: ABS-Dateien auswaehlen, Reihenfolge optimieren, "
+            "wissenschaftlich beschreiben und im interaktiven Viewer untersuchen."
+        )
+    )
+    parser.add_argument("--viewer-payload", help=argparse.SUPPRESS)
+    parser.add_argument("input_files", nargs="*", help="Optionale Eingabedateien. Ohne Angabe erscheint der Explorer.")
+    parser.add_argument("--w1", type=float, default=W1_DEFAULT, help="Gewicht fuer die Distanz zum aktuellen Punkt.")
+    parser.add_argument("--w2", type=float, default=W2_DEFAULT, help="Gewicht fuer die Distanz zu den letzten Punkten.")
+    parser.add_argument("--memory", type=int, default=MEMORY_DEFAULT, help="Anzahl der gemerkten letzten Punkte.")
+    parser.add_argument(
+        "--mode",
+        choices=allowed_modes,
+        default="local_greedy",
+        help=(
+            "Optimierungsmodus. Kanonische Modi: "
+            f"{canonical_mode_help}. Legacy-Aliase bleiben unterstuetzt."
+        ),
+    )
+    parser.add_argument(
+        "--grid-spacing",
+        type=float,
+        default=GRID_SPREAD_DEFAULT_SPACING,
+        help="Virtueller Gitterabstand fuer die Grid-Dispersion-Modi.",
+    )
+    parser.add_argument(
+        "--recent-percent",
+        type=float,
+        default=GRID_SPREAD_DEFAULT_RECENT_PERCENT,
+        help="Groesse des beruecksichtigten Recent Sets fuer die Grid-Dispersion-Modi.",
+    )
+    parser.add_argument(
+        "--age-decay",
+        type=float,
+        default=GRID_SPREAD_AGE_DECAY_DEFAULT,
+        help="Altersabwaegung fuer die Grid-Dispersion-Modi. 1.0 = kein Abfall.",
+    )
+    args = parser.parse_args()
+
+    if args.viewer_payload:
+        sys.exit(run_interactive_viewer(args.viewer_payload))
+
+    try:
+        run_self_tests()
+    except AssertionError as exc:
+        print(f"Self-Test fehlgeschlagen: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        app = ComparisonApp(
+            args.input_files,
+            w1=args.w1,
+            w2=args.w2,
+            memory=args.memory,
+            mode=normalize_mode(args.mode),
+            grid_spacing=args.grid_spacing,
+            recent_percent=args.recent_percent,
+            age_decay=args.age_decay,
+        )
+        app.mainloop()
+    except tk.TclError as exc:
+        show_fatal_error(
+            "Die grafische Oberfläche konnte nicht gestartet werden.\n\n"
+            "Bitte verwenden Sie eine Python-Installation mit funktionierendem Tkinter/Tcl-Tk.\n\n"
+            f"Technischer Hinweis:\n{exc}"
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

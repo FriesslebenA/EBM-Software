@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ABS Reihenfolge Vergleich</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #000000;
+      color: #f2f2f2;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+    }
+
+    .layout {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      padding: 18px;
+      justify-content: center;
+      align-items: flex-start;
+    }
+
+    .panel {
+      flex: 1 1 520px;
+      max-width: 720px;
+      background: #070707;
+      border: 1px solid #232323;
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 0 30px rgba(255, 255, 255, 0.03);
+    }
+
+    h2 {
+      margin: 0 0 12px 0;
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    canvas {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      display: block;
+      background: #000000;
+      border: 1px solid #1d1d1d;
+      border-radius: 8px;
+    }
+
+    .info {
+      margin-top: 10px;
+      font-size: 15px;
+      color: #d9d9d9;
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <section class="panel">
+      <h2>Original</h2>
+      <canvas id="canvas-old" width="720" height="720"></canvas>
+      <div id="label-old" class="info">Punkt 1 / 3</div>
+    </section>
+    <section class="panel">
+      <h2>Optimiert</h2>
+      <canvas id="canvas-new" width="720" height="720"></canvas>
+      <div id="label-new" class="info">Punkt 1 / 3</div>
+    </section>
+  </div>
+
+  <script>
+    const originalPoints = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
+    const optimizedPoints = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
+    const bounds = {"minX": 0.0, "maxX": 1.0, "minY": 0.0, "maxY": 1.0, "width": 1.0, "height": 1.0};
+    const fps = 3;
+    const intervalMs = 1000 / fps;
+    const historyColors = ["#ffffff", "#ffb3b3", "#ff6666", "#ff1010"];
+
+    function mapPoint(point, canvas) {
+      const margin = 36;
+      const availableWidth = canvas.width - margin * 2;
+      const availableHeight = canvas.height - margin * 2;
+      const scale = Math.min(availableWidth / bounds.width, availableHeight / bounds.height);
+
+      const contentWidth = bounds.width * scale;
+      const contentHeight = bounds.height * scale;
+      const offsetX = (canvas.width - contentWidth) / 2;
+      const offsetY = (canvas.height - contentHeight) / 2;
+
+      const x = offsetX + (point[0] - bounds.minX) * scale;
+      const y = canvas.height - (offsetY + (point[1] - bounds.minY) * scale);
+      return [x, y];
+    }
+
+    function drawBackgroundPoints(ctx, points) {
+      ctx.fillStyle = "#1b1b1b";
+      for (const point of points) {
+        const [x, y] = mapPoint(point, ctx.canvas);
+        ctx.beginPath();
+        ctx.arc(x, y, 2.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawPath(ctx, points, currentIndex) {
+      if (currentIndex <= 0) {
+        return;
+      }
+
+      ctx.strokeStyle = "#7a7a7a";
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      const [startX, startY] = mapPoint(points[0], ctx.canvas);
+      ctx.moveTo(startX, startY);
+
+      for (let index = 1; index <= currentIndex; index += 1) {
+        const [x, y] = mapPoint(points[index], ctx.canvas);
+        ctx.lineTo(x, y);
+      }
+
+      ctx.stroke();
+    }
+
+    function drawRecentPoints(ctx, points, currentIndex) {
+      const recentPoints = points.slice(Math.max(0, currentIndex - 3), currentIndex + 1);
+      const colorOffset = historyColors.length - recentPoints.length;
+
+      recentPoints.forEach((point, index) => {
+        const [x, y] = mapPoint(point, ctx.canvas);
+        const color = historyColors[colorOffset + index];
+        const radius = index === recentPoints.length - 1 ? 6.5 : 5.0;
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    function drawPanel(canvasId, labelId, points, currentIndex) {
+      const canvas = document.getElementById(canvasId);
+      const label = document.getElementById(labelId);
+      const ctx = canvas.getContext("2d");
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      drawBackgroundPoints(ctx, points);
+      drawPath(ctx, points, currentIndex);
+      drawRecentPoints(ctx, points, currentIndex);
+
+      label.textContent = `Punkt ${currentIndex + 1} / ${points.length}`;
+    }
+
+    function startAnimation() {
+      let currentIndex = 0;
+
+      function step() {
+        drawPanel("canvas-old", "label-old", originalPoints, currentIndex);
+        drawPanel("canvas-new", "label-new", optimizedPoints, currentIndex);
+        currentIndex = (currentIndex + 1) % originalPoints.length;
+      }
+
+      step();
+      setInterval(step, intervalMs);
+    }
+
+    window.addEventListener("load", startAnimation);
+  </script>
+</body>
+</html>

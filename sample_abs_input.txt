@@ -1,0 +1,5 @@
+﻿# Header
+ABS 0.0 0.0
+Kommentar
+ABS 1.0 0.0
+ABS 1.0 1.0
