@@ -2255,10 +2255,15 @@ def run_interactive_viewer(payload_path: str) -> int:
             self._update_trail_label()
 
             initial_index = int(payload_data.get("selected_index", 0))
-            if 0 <= initial_index < len(self.results):
-                self.result_box.setCurrentIndex(initial_index)
+            if not self.results:
+                self.info_label.setText("Keine Ergebnisse fuer die Visualisierung vorhanden.")
             else:
-                self._set_result(0)
+                if not 0 <= initial_index < len(self.results):
+                    initial_index = 0
+                self.result_box.blockSignals(True)
+                self.result_box.setCurrentIndex(initial_index)
+                self.result_box.blockSignals(False)
+                self._set_result(initial_index)
 
             self.timer.start()
 
