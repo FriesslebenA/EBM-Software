@@ -2222,8 +2222,8 @@ def run_interactive_viewer(payload_path: str) -> int:
 
             control_row.addWidget(QtWidgets.QLabel("Trail length"))
             self.trail_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-            self.trail_slider.setRange(1, 64)
-            self.trail_slider.setValue(24)
+            self.trail_slider.setRange(1, 1)
+            self.trail_slider.setValue(1)
             self.trail_slider.valueChanged.connect(self._update_trail_label)
             control_row.addWidget(self.trail_slider)
             self.trail_label = QtWidgets.QLabel()
@@ -2289,9 +2289,14 @@ def run_interactive_viewer(payload_path: str) -> int:
             result = self.results[self.current_index]
             self.current_progress = 0.0
             point_count = max(len(result["original_points_np"]), len(result["optimized_points_np"]), 1)
-            self.trail_slider.setMaximum(max(1, min(point_count, 512)))
-            if self.trail_slider.value() > self.trail_slider.maximum():
-                self.trail_slider.setValue(self.trail_slider.maximum())
+            trail_maximum = max(1, point_count)
+            self.trail_slider.setRange(1, trail_maximum)
+            if self.trail_slider.value() > trail_maximum:
+                self.trail_slider.setValue(trail_maximum)
+            elif self.trail_slider.value() < 1:
+                self.trail_slider.setValue(1)
+            elif self.trail_slider.value() == 1 and trail_maximum > 1:
+                self.trail_slider.setValue(min(24, trail_maximum))
             self.original_panel.set_points(result["original_points_np"])
             self.optimized_panel.set_points(result["optimized_points_np"])
             self._reset_views()
