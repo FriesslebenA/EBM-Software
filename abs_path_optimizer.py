@@ -2252,17 +2252,30 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.speed_slider.setRange(1, ANIMATION_MAX_MULTIPLIER)
             self.speed_slider.setValue(60)
-            self.speed_slider.valueChanged.connect(self._update_speed_label)
+            self.speed_slider.valueChanged.connect(self._on_speed_slider_changed)
             control_row.addWidget(self.speed_slider)
-            self.speed_label = QtWidgets.QLabel()
-            control_row.addWidget(self.speed_label)
+            self.speed_input = QtWidgets.QDoubleSpinBox()
+            self.speed_input.setDecimals(1)
+            self.speed_input.setRange(VIEWER_POINTS_PER_SECOND_BASE, VIEWER_POINTS_PER_SECOND_MAX)
+            self.speed_input.setSingleStep(VIEWER_POINTS_PER_SECOND_BASE)
+            self.speed_input.setSuffix(" pts/s")
+            self.speed_input.setAccelerated(True)
+            self.speed_input.setFixedWidth(120)
+            self.speed_input.valueChanged.connect(self._on_speed_input_changed)
+            control_row.addWidget(self.speed_input)
 
             control_row.addWidget(QtWidgets.QLabel("Trail length"))
             self.trail_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.trail_slider.setRange(1, 1)
             self.trail_slider.setValue(1)
-            self.trail_slider.valueChanged.connect(self._on_trail_settings_changed)
+            self.trail_slider.valueChanged.connect(self._on_trail_slider_changed)
             control_row.addWidget(self.trail_slider)
+            self.trail_input = QtWidgets.QSpinBox()
+            self.trail_input.setRange(1, 1)
+            self.trail_input.setAccelerated(True)
+            self.trail_input.setFixedWidth(90)
+            self.trail_input.valueChanged.connect(self._on_trail_input_changed)
+            control_row.addWidget(self.trail_input)
             self.trail_label = QtWidgets.QLabel()
             control_row.addWidget(self.trail_label)
 
@@ -2270,8 +2283,14 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.gradient_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.gradient_slider.setRange(1, 1)
             self.gradient_slider.setValue(1)
-            self.gradient_slider.valueChanged.connect(self._on_trail_settings_changed)
+            self.gradient_slider.valueChanged.connect(self._on_gradient_slider_changed)
             control_row.addWidget(self.gradient_slider)
+            self.gradient_input = QtWidgets.QSpinBox()
+            self.gradient_input.setRange(1, 1)
+            self.gradient_input.setAccelerated(True)
+            self.gradient_input.setFixedWidth(90)
+            self.gradient_input.valueChanged.connect(self._on_gradient_input_changed)
+            control_row.addWidget(self.gradient_input)
             self.gradient_label = QtWidgets.QLabel()
             control_row.addWidget(self.gradient_label)
 
@@ -2297,7 +2316,7 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.timer.timeout.connect(self._tick)
 
             self._connect_synced_views()
-            self._update_speed_label()
+            self._sync_speed_controls_from_slider()
             self._update_trail_controls(update_panels=False)
 
             initial_index = int(payload_data.get("selected_index", 0))
@@ -2340,10 +2359,14 @@ def run_interactive_viewer(payload_path: str) -> int:
             gradient_default = min(VIEWER_DEFAULT_GRADIENT_WINDOW, trail_maximum)
 
             self.trail_slider.blockSignals(True)
+            self.trail_input.blockSignals(True)
             self.gradient_slider.blockSignals(True)
+            self.gradient_input.blockSignals(True)
 
             self.trail_slider.setRange(1, trail_maximum)
+            self.trail_input.setRange(1, trail_maximum)
             self.gradient_slider.setRange(1, trail_maximum)
+            self.gradient_input.setRange(1, trail_maximum)
 
             trail_value = self.trail_slider.value()
             if trail_value > trail_maximum:
@@ -2365,7 +2388,9 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.gradient_slider.setValue(gradient_value)
 
             self.trail_slider.blockSignals(False)
+            self.trail_input.blockSignals(False)
             self.gradient_slider.blockSignals(False)
+            self.gradient_input.blockSignals(False)
 
             self.original_panel.set_points(result["original_points_np"])
             self.optimized_panel.set_points(result["optimized_points_np"])
@@ -2382,21 +2407,64 @@ def run_interactive_viewer(payload_path: str) -> int:
                 f"Output name: {result['output_name']} | Points: {result['point_count']}"
             )
 
-        def _update_speed_label(self) -> None:
-            points_per_second = min(VIEWER_POINTS_PER_SECOND_MAX, VIEWER_POINTS_PER_SECOND_BASE * self.speed_slider.value())
-            self.speed_label.setText(f"{points_per_second:.1f} points/s")
+        def _points_per_second_from_slider_value(self, slider_value: int) -> float:
+            return min(VIEWER_POINTS_PER_SECOND_MAX, VIEWER_POINTS_PER_SECOND_BASE * slider_value)
+
+        def _slider_value_from_points_per_second(self, points_per_second: float) -> int:
+            raw_value = int(round(float(points_per_second) / VIEWER_POINTS_PER_SECOND_BASE))
+            return max(1, min(ANIMATION_MAX_MULTIPLIER, raw_value))
+
+        def _sync_speed_controls_from_slider(self) -> None:
+            points_per_second = self._points_per_second_from_slider_value(self.speed_slider.value())
+            self.speed_input.blockSignals(True)
+            self.speed_input.setValue(points_per_second)
+            self.speed_input.blockSignals(False)
+
+        def _on_speed_slider_changed(self, _value: int) -> None:
+            self._sync_speed_controls_from_slider()
+
+        def _on_speed_input_changed(self, value: float) -> None:
+            slider_value = self._slider_value_from_points_per_second(value)
+            if slider_value != self.speed_slider.value():
+                self.speed_slider.setValue(slider_value)
+            else:
+                self._sync_speed_controls_from_slider()
 
         def _update_trail_controls(self, update_panels: bool = True) -> None:
             trail_length = self.trail_slider.value()
             gradient_window = self.gradient_slider.value()
+
+            self.trail_input.blockSignals(True)
+            self.trail_input.setValue(trail_length)
+            self.trail_input.blockSignals(False)
+
+            self.gradient_input.blockSignals(True)
+            self.gradient_input.setValue(gradient_window)
+            self.gradient_input.blockSignals(False)
+
             active_gradient = min(trail_length, gradient_window)
-            self.trail_label.setText(f"{self.trail_slider.value()} points")
+            self.trail_label.setText(f"{trail_length} points")
             self.gradient_label.setText(f"{gradient_window} points | {active_gradient} active")
             if update_panels:
                 self._update_panels()
 
-        def _on_trail_settings_changed(self, _value: int) -> None:
+        def _on_trail_slider_changed(self, _value: int) -> None:
             self._update_trail_controls(update_panels=True)
+
+        def _on_trail_input_changed(self, value: int) -> None:
+            if value != self.trail_slider.value():
+                self.trail_slider.setValue(value)
+            else:
+                self._update_trail_controls(update_panels=True)
+
+        def _on_gradient_slider_changed(self, _value: int) -> None:
+            self._update_trail_controls(update_panels=True)
+
+        def _on_gradient_input_changed(self, value: int) -> None:
+            if value != self.gradient_slider.value():
+                self.gradient_slider.setValue(value)
+            else:
+                self._update_trail_controls(update_panels=True)
 
         def _toggle_playback(self) -> None:
             if self.timer.isActive():
