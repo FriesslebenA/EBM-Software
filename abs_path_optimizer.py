@@ -40,9 +40,16 @@ VIEWER_POINTS_PER_SECOND_BASE = 3.0
 VIEWER_POINTS_PER_SECOND_MAX = 3000.0
 VIEWER_TIMER_INTERVAL_MS = 33
 VIEWER_DEFAULT_GRADIENT_WINDOW = 1000
+VIEWER_PLAYBACK_GRADIENT_CAP = VIEWER_DEFAULT_GRADIENT_WINDOW
 VIEWER_BACKGROUND_COLOR = "#232323"
 VIEWER_VISITED_COLOR = "#666666"
 VIEWER_HEAD_COLOR = "#ff3030"
+VIEWER_NAVIGATION_DYNAMIC_MARKERS = 750
+VIEWER_PLAYBACK_DYNAMIC_MARKERS = 2000
+VIEWER_IDLE_DYNAMIC_MARKERS = 10000
+VIEWER_AUTO_RESUME_DELAY_MS = 300
+VIEWER_SLIDER_DRAG_REFRESH_HZ = 10
+VIEWER_SLIDER_DRAG_INTERVAL_MS = max(1, int(round(1000 / VIEWER_SLIDER_DRAG_REFRESH_HZ)))
 MODE_PARAMETER_MEMORY = "memory"
 MODE_PARAMETER_GRID_SPACING = "grid_spacing"
 MODE_PARAMETER_RECENT_PERCENT = "recent_percent"
@@ -72,6 +79,33 @@ class ModeSpec:
     label: str
     description: str
     visible_parameters: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ViewerRenderPolicy:
+    name: str
+    dynamic_marker_budget: int
+
+
+@dataclass(frozen=True)
+class ViewerRenderStats:
+    requested_trail_count: int
+    requested_gradient_count: int
+    displayed_trail_count: int
+    displayed_gradient_count: int
+    policy_name: str
+
+
+VIEWER_RENDER_POLICY_NAVIGATION = ViewerRenderPolicy("navigation", VIEWER_NAVIGATION_DYNAMIC_MARKERS)
+VIEWER_RENDER_POLICY_PLAYBACK = ViewerRenderPolicy("playback", VIEWER_PLAYBACK_DYNAMIC_MARKERS)
+VIEWER_RENDER_POLICY_IDLE = ViewerRenderPolicy("idle_refine", VIEWER_IDLE_DYNAMIC_MARKERS)
+VIEWER_EMPTY_RENDER_STATS = ViewerRenderStats(
+    requested_trail_count=0,
+    requested_gradient_count=0,
+    displayed_trail_count=0,
+    displayed_gradient_count=0,
+    policy_name=VIEWER_RENDER_POLICY_IDLE.name,
+)
 
 
 MODE_SPECS: Dict[str, ModeSpec] = {
@@ -2086,7 +2120,9 @@ def run_interactive_viewer(payload_path: str) -> int:
             super().__init__()
             self.points = np.empty((0, 2), dtype=float)
             self.trail_brush_cache: Dict[int, List[Any]] = {}
-            self.last_render_key: Optional[Tuple[int, int, int]] = None
+            self.last_render_key: Optional[Tuple[int, int, int, str]] = None
+            self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
+            self.current_gray_range: Optional[Tuple[int, int]] = None
 
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -2123,6 +2159,8 @@ def run_interactive_viewer(payload_path: str) -> int:
         def set_points(self, points: Any) -> None:
             self.points = points
             self.last_render_key = None
+            self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
+            self.current_gray_range = None
             if len(points) == 0:
                 self.background_item.setData([], [])
                 self.visited_gray_item.setData([], [])
@@ -2145,7 +2183,13 @@ def run_interactive_viewer(payload_path: str) -> int:
                 self.trail_brush_cache[count] = brushes
             return brushes
 
-        def _update_visible_layers(self, base_index: int, trail_length: int, gradient_window: int) -> None:
+        def _update_visible_layers(
+            self,
+            base_index: int,
+            trail_length: int,
+            gradient_window: int,
+            render_policy: ViewerRenderPolicy,
+        ) -> ViewerRenderStats:
             gray_range, gradient_range = compute_viewer_trail_ranges(
                 point_count=len(self.points),
                 base_index=base_index,
@@ -2153,28 +2197,77 @@ def run_interactive_viewer(payload_path: str) -> int:
                 gradient_window=gradient_window,
             )
 
-            if gray_range is None:
-                self.visited_gray_item.setData([], [])
-            else:
-                gray_points = self.points[gray_range[0] : gray_range[1] + 1]
-                self.visited_gray_item.setData(x=gray_points[:, 0], y=gray_points[:, 1])
+            use_incremental_gray = render_policy.name in (
+                VIEWER_RENDER_POLICY_PLAYBACK.name,
+                VIEWER_RENDER_POLICY_NAVIGATION.name,
+            )
+            gray_displayed = self._apply_gray_range(gray_range, allow_incremental=use_incremental_gray)
 
             if gradient_range is None:
                 self.trail_item.setData([], [])
+                gradient_displayed = 0
             else:
                 gradient_points = self.points[gradient_range[0] : gradient_range[1] + 1]
-                gradient_count = len(gradient_points)
+                gradient_displayed = len(gradient_points)
                 self.trail_item.setData(
                     x=gradient_points[:, 0],
                     y=gradient_points[:, 1],
-                    brush=self._get_trail_brushes(gradient_count),
+                    brush=self._get_trail_brushes(gradient_displayed),
                 )
 
-        def update_progress(self, progress: float, trail_length: int, gradient_window: int) -> None:
+            gray_requested = 0 if gray_range is None else gray_range[1] - gray_range[0] + 1
+            gradient_requested = 0 if gradient_range is None else gradient_range[1] - gradient_range[0] + 1
+            return ViewerRenderStats(
+                requested_trail_count=gray_requested + gradient_requested,
+                requested_gradient_count=gradient_requested,
+                displayed_trail_count=gray_displayed + gradient_displayed,
+                displayed_gradient_count=gradient_displayed,
+                policy_name=render_policy.name,
+            )
+
+        def _apply_gray_range(self, gray_range: Optional[Tuple[int, int]], allow_incremental: bool) -> int:
+            if gray_range is None:
+                self.visited_gray_item.setData([], [])
+                self.current_gray_range = None
+                return 0
+
+            start_index, end_index = gray_range
+            if end_index < start_index:
+                self.visited_gray_item.setData([], [])
+                self.current_gray_range = None
+                return 0
+
+            if (
+                allow_incremental
+                and self.current_gray_range is not None
+                and start_index == self.current_gray_range[0]
+                and end_index >= self.current_gray_range[1]
+            ):
+                previous_end = self.current_gray_range[1]
+                if end_index > previous_end:
+                    new_points = self.points[previous_end + 1 : end_index + 1]
+                    if len(new_points) > 0:
+                        self.visited_gray_item.addPoints(x=new_points[:, 0], y=new_points[:, 1])
+                self.current_gray_range = (start_index, end_index)
+                return end_index - start_index + 1
+
+            gray_points = self.points[start_index : end_index + 1]
+            self.visited_gray_item.setData(x=gray_points[:, 0], y=gray_points[:, 1])
+            self.current_gray_range = (start_index, end_index)
+            return len(gray_points)
+
+        def update_progress(
+            self,
+            progress: float,
+            trail_length: int,
+            gradient_window: int,
+            render_policy: ViewerRenderPolicy,
+        ) -> ViewerRenderStats:
             point_count = len(self.points)
             if point_count == 0:
                 self.point_label.setText("Point 0 / 0")
-                return
+                self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
+                return VIEWER_EMPTY_RENDER_STATS
 
             safe_progress = max(0.0, min(float(progress), point_count - 1))
             base_index = min(max(int(safe_progress), 0), point_count - 1)
@@ -2187,12 +2280,23 @@ def run_interactive_viewer(payload_path: str) -> int:
             head_x = float(start_point[0] + (end_point[0] - start_point[0]) * segment_fraction)
             head_y = float(start_point[1] + (end_point[1] - start_point[1]) * segment_fraction)
 
-            render_key = (base_index, safe_trail_length, safe_gradient_window)
+            render_key = (
+                base_index,
+                safe_trail_length,
+                safe_gradient_window,
+                render_policy.name,
+            )
             if render_key != self.last_render_key:
-                self._update_visible_layers(base_index, safe_trail_length, safe_gradient_window)
+                self.last_render_stats = self._update_visible_layers(
+                    base_index,
+                    safe_trail_length,
+                    safe_gradient_window,
+                    render_policy,
+                )
                 self.last_render_key = render_key
             self.head_item.setData([head_x], [head_y])
             self.point_label.setText(f"Point {base_index + 1} / {point_count}")
+            return self.last_render_stats
 
         def pan_by_fraction(self, x_fraction: float, y_fraction: float) -> None:
             view_box = self.plot_widget.getViewBox()
@@ -2225,6 +2329,14 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.current_index = 0
             self.current_progress = 0.0
             self.sync_guard = False
+            self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
+            self.heavy_slider_drag_count = 0
+            self.user_paused = False
+            self.auto_paused_for_navigation = False
+            self.navigation_active = False
+            self.playback_start_progress = 0.0
+            self.playback_points_per_second = VIEWER_POINTS_PER_SECOND_BASE
+            self.playback_elapsed = QtCore.QElapsedTimer()
 
             self.setWindowTitle(f"{payload_data.get('app_name', APP_DISPLAY_NAME)} - Interactive viewer")
             self.resize(1560, 920)
@@ -2269,6 +2381,8 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.trail_slider.setRange(1, 1)
             self.trail_slider.setValue(1)
             self.trail_slider.valueChanged.connect(self._on_trail_slider_changed)
+            self.trail_slider.sliderPressed.connect(self._on_heavy_slider_pressed)
+            self.trail_slider.sliderReleased.connect(self._on_heavy_slider_released)
             control_row.addWidget(self.trail_slider)
             self.trail_input = QtWidgets.QSpinBox()
             self.trail_input.setRange(1, 1)
@@ -2284,6 +2398,8 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.gradient_slider.setRange(1, 1)
             self.gradient_slider.setValue(1)
             self.gradient_slider.valueChanged.connect(self._on_gradient_slider_changed)
+            self.gradient_slider.sliderPressed.connect(self._on_heavy_slider_pressed)
+            self.gradient_slider.sliderReleased.connect(self._on_heavy_slider_released)
             control_row.addWidget(self.gradient_slider)
             self.gradient_input = QtWidgets.QSpinBox()
             self.gradient_input.setRange(1, 1)
@@ -2313,11 +2429,21 @@ def run_interactive_viewer(payload_path: str) -> int:
 
             self.timer = QtCore.QTimer(self)
             self.timer.setInterval(VIEWER_TIMER_INTERVAL_MS)
+            self.timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
             self.timer.timeout.connect(self._tick)
+            self.navigation_resume_timer = QtCore.QTimer(self)
+            self.navigation_resume_timer.setSingleShot(True)
+            self.navigation_resume_timer.setInterval(VIEWER_AUTO_RESUME_DELAY_MS)
+            self.navigation_resume_timer.timeout.connect(self._on_navigation_idle)
+            self.slider_refresh_timer = QtCore.QTimer(self)
+            self.slider_refresh_timer.setSingleShot(True)
+            self.slider_refresh_timer.setInterval(VIEWER_SLIDER_DRAG_INTERVAL_MS)
+            self.slider_refresh_timer.timeout.connect(self._apply_throttled_slider_update)
 
             self._connect_synced_views()
             self._sync_speed_controls_from_slider()
-            self._update_trail_controls(update_panels=False)
+            self._sync_trail_inputs()
+            self._update_render_feedback()
 
             initial_index = int(payload_data.get("selected_index", 0))
             if not self.results:
@@ -2329,8 +2455,7 @@ def run_interactive_viewer(payload_path: str) -> int:
                 self.result_box.setCurrentIndex(initial_index)
                 self.result_box.blockSignals(False)
                 self._set_result(initial_index)
-
-            self.timer.start()
+                self._start_playback()
 
         def _connect_synced_views(self) -> None:
             left_view = self.original_panel.plot_widget.getViewBox()
@@ -2346,13 +2471,98 @@ def run_interactive_viewer(payload_path: str) -> int:
 
             left_view.sigRangeChanged.connect(lambda *_args: sync_range(left_view, right_view))
             right_view.sigRangeChanged.connect(lambda *_args: sync_range(right_view, left_view))
+            left_view.sigRangeChangedManually.connect(self._on_manual_range_change)
+            right_view.sigRangeChangedManually.connect(self._on_manual_range_change)
+
+        def _current_point_count(self) -> int:
+            if not self.results:
+                return 0
+            result = self.results[self.current_index]
+            return max(len(result["original_points_np"]), len(result["optimized_points_np"]))
+
+        def _current_render_policy(self) -> ViewerRenderPolicy:
+            if self.navigation_active or self.auto_paused_for_navigation or self.heavy_slider_drag_count > 0:
+                return VIEWER_RENDER_POLICY_NAVIGATION
+            if self.timer.isActive():
+                return VIEWER_RENDER_POLICY_PLAYBACK
+            return VIEWER_RENDER_POLICY_IDLE
+
+        def _current_requested_points_per_second(self) -> float:
+            return self._points_per_second_from_slider_value(self.speed_slider.value())
+
+        def _restart_playback_clock(self) -> None:
+            self.playback_points_per_second = self._current_requested_points_per_second()
+            self.playback_start_progress = self.current_progress
+            self.playback_elapsed.restart()
+
+        def _progress_from_playback_clock(self) -> float:
+            point_count = self._current_point_count()
+            if point_count <= 1:
+                return 0.0
+            if not self.playback_elapsed.isValid():
+                return float(self.current_progress)
+            elapsed_seconds = self.playback_elapsed.elapsed() / 1000.0
+            loop_extent = point_count - 1
+            if loop_extent <= 0:
+                return 0.0
+            return (self.playback_start_progress + elapsed_seconds * self.playback_points_per_second) % loop_extent
+
+        def _sync_current_progress_from_clock(self) -> None:
+            self.current_progress = self._progress_from_playback_clock()
+
+        def _start_playback(self) -> None:
+            if not self.results:
+                return
+            self.auto_paused_for_navigation = False
+            self.user_paused = False
+            self._restart_playback_clock()
+            self.timer.start()
+            self.play_button.setText("Pause")
+
+        def _stop_playback(self, *, manual: bool) -> None:
+            if self.timer.isActive():
+                self._sync_current_progress_from_clock()
+            self.timer.stop()
+            self.playback_elapsed.invalidate()
+            self.user_paused = manual
+            self.play_button.setText("Play")
+
+        def _pause_for_navigation(self) -> None:
+            if self.timer.isActive():
+                self._sync_current_progress_from_clock()
+                self.timer.stop()
+                self.playback_elapsed.invalidate()
+                self.auto_paused_for_navigation = True
+                self.play_button.setText("Play")
+
+        def _sync_trail_inputs(self) -> None:
+            trail_length = self.trail_slider.value()
+            gradient_window = self.gradient_slider.value()
+
+            self.trail_input.blockSignals(True)
+            self.trail_input.setValue(trail_length)
+            self.trail_input.blockSignals(False)
+
+            self.gradient_input.blockSignals(True)
+            self.gradient_input.setValue(gradient_window)
+            self.gradient_input.blockSignals(False)
+
+        def _update_render_feedback(self) -> None:
+            trail_length = self.trail_slider.value()
+            gradient_window = self.gradient_slider.value()
+            self.trail_label.setText(f"{trail_length} points")
+            self.gradient_label.setText(f"{gradient_window} points")
 
         def _set_result(self, index: int) -> None:
             if not self.results:
                 return
+            was_playing = self.timer.isActive()
+            if was_playing:
+                self._sync_current_progress_from_clock()
             self.current_index = max(0, min(index, len(self.results) - 1))
             result = self.results[self.current_index]
             self.current_progress = 0.0
+            self.playback_start_progress = 0.0
             point_count = max(len(result["original_points_np"]), len(result["optimized_points_np"]), 1)
             trail_maximum = max(1, point_count)
             trail_default = min(24, trail_maximum)
@@ -2396,7 +2606,10 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.optimized_panel.set_points(result["optimized_points_np"])
             self._reset_views()
             self._update_info_label()
-            self._update_trail_controls(update_panels=True)
+            self._sync_trail_inputs()
+            self._update_panels()
+            if was_playing:
+                self._restart_playback_clock()
 
         def _update_info_label(self) -> None:
             result = self.results[self.current_index]
@@ -2421,58 +2634,99 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.speed_input.blockSignals(False)
 
         def _on_speed_slider_changed(self, _value: int) -> None:
+            if self.timer.isActive():
+                self._sync_current_progress_from_clock()
+                self._restart_playback_clock()
             self._sync_speed_controls_from_slider()
 
         def _on_speed_input_changed(self, value: float) -> None:
+            if self.timer.isActive():
+                self._sync_current_progress_from_clock()
             slider_value = self._slider_value_from_points_per_second(value)
             if slider_value != self.speed_slider.value():
                 self.speed_slider.setValue(slider_value)
             else:
+                if self.timer.isActive():
+                    self._restart_playback_clock()
                 self._sync_speed_controls_from_slider()
 
-        def _update_trail_controls(self, update_panels: bool = True) -> None:
-            trail_length = self.trail_slider.value()
-            gradient_window = self.gradient_slider.value()
-
-            self.trail_input.blockSignals(True)
-            self.trail_input.setValue(trail_length)
-            self.trail_input.blockSignals(False)
-
-            self.gradient_input.blockSignals(True)
-            self.gradient_input.setValue(gradient_window)
-            self.gradient_input.blockSignals(False)
-
-            active_gradient = min(trail_length, gradient_window)
-            self.trail_label.setText(f"{trail_length} points")
-            self.gradient_label.setText(f"{gradient_window} points | {active_gradient} active")
-            if update_panels:
-                self._update_panels()
-
         def _on_trail_slider_changed(self, _value: int) -> None:
-            self._update_trail_controls(update_panels=True)
+            self._sync_trail_inputs()
+            self._update_render_feedback()
+            if self.heavy_slider_drag_count > 0:
+                self._schedule_throttled_slider_update()
+            else:
+                self._update_panels()
 
         def _on_trail_input_changed(self, value: int) -> None:
             if value != self.trail_slider.value():
                 self.trail_slider.setValue(value)
             else:
-                self._update_trail_controls(update_panels=True)
+                self._sync_trail_inputs()
+                self._update_panels()
 
         def _on_gradient_slider_changed(self, _value: int) -> None:
-            self._update_trail_controls(update_panels=True)
+            self._sync_trail_inputs()
+            self._update_render_feedback()
+            if self.heavy_slider_drag_count > 0:
+                self._schedule_throttled_slider_update()
+            else:
+                self._update_panels()
 
         def _on_gradient_input_changed(self, value: int) -> None:
             if value != self.gradient_slider.value():
                 self.gradient_slider.setValue(value)
             else:
-                self._update_trail_controls(update_panels=True)
+                self._sync_trail_inputs()
+                self._update_panels()
+
+        def _on_heavy_slider_pressed(self) -> None:
+            self.heavy_slider_drag_count += 1
+            self._update_panels()
+
+        def _on_heavy_slider_released(self) -> None:
+            self.heavy_slider_drag_count = max(0, self.heavy_slider_drag_count - 1)
+            self.slider_refresh_timer.stop()
+            self._update_panels()
+
+        def _schedule_throttled_slider_update(self) -> None:
+            if not self.slider_refresh_timer.isActive():
+                self.slider_refresh_timer.start()
+
+        def _apply_throttled_slider_update(self) -> None:
+            self._update_panels()
+
+        def _on_manual_range_change(self, *_args: object) -> None:
+            if not self.results:
+                return
+            first_navigation_event = not self.navigation_active
+            self.navigation_active = True
+            self.navigation_resume_timer.start()
+            if self.timer.isActive():
+                self._pause_for_navigation()
+            if first_navigation_event:
+                self._update_panels()
+
+        def _on_navigation_idle(self) -> None:
+            had_navigation_state = self.navigation_active or self.auto_paused_for_navigation
+            self.navigation_active = False
+            if self.auto_paused_for_navigation and not self.user_paused:
+                self.auto_paused_for_navigation = False
+                self._start_playback()
+                return
+            self.auto_paused_for_navigation = False
+            if had_navigation_state:
+                self._update_panels()
 
         def _toggle_playback(self) -> None:
             if self.timer.isActive():
-                self.timer.stop()
-                self.play_button.setText("Play")
+                self.navigation_resume_timer.stop()
+                self.auto_paused_for_navigation = False
+                self._stop_playback(manual=True)
             else:
-                self.timer.start()
-                self.play_button.setText("Pause")
+                self.navigation_resume_timer.stop()
+                self.auto_paused_for_navigation = False
+                self._start_playback()
 
         def _reset_views(self) -> None:
             self.original_panel.reset_view()
@@ -2481,10 +2735,43 @@ def run_interactive_viewer(payload_path: str) -> int:
         def _update_panels(self) -> None:
             if not self.results:
                 return
+            if self.timer.isActive():
+                self.current_progress = self._progress_from_playback_clock()
             trail_length = self.trail_slider.value()
             gradient_window = self.gradient_slider.value()
-            self.original_panel.update_progress(self.current_progress, trail_length, gradient_window)
-            self.optimized_panel.update_progress(self.current_progress, trail_length, gradient_window)
+            render_policy = self._current_render_policy()
+            effective_gradient_window = gradient_window
+            if render_policy.name in (
+                VIEWER_RENDER_POLICY_PLAYBACK.name,
+                VIEWER_RENDER_POLICY_NAVIGATION.name,
+            ):
+                effective_gradient_window = min(gradient_window, VIEWER_PLAYBACK_GRADIENT_CAP)
+            original_stats = self.original_panel.update_progress(
+                self.current_progress,
+                trail_length,
+                effective_gradient_window,
+                render_policy,
+            )
+            optimized_stats = self.optimized_panel.update_progress(
+                self.current_progress,
+                trail_length,
+                effective_gradient_window,
+                render_policy,
+            )
+            self.last_render_stats = ViewerRenderStats(
+                requested_trail_count=max(original_stats.requested_trail_count, optimized_stats.requested_trail_count),
+                requested_gradient_count=max(
+                    original_stats.requested_gradient_count,
+                    optimized_stats.requested_gradient_count,
+                ),
+                displayed_trail_count=max(original_stats.displayed_trail_count, optimized_stats.displayed_trail_count),
+                displayed_gradient_count=max(
+                    original_stats.displayed_gradient_count,
+                    optimized_stats.displayed_gradient_count,
+                ),
+                policy_name=render_policy.name,
+            )
+            self._update_render_feedback()
 
         def _tick(self) -> None:
             if not self.results:
@@ -2494,11 +2781,6 @@ def run_interactive_viewer(payload_path: str) -> int:
             if point_count <= 1:
                 self._update_panels()
                 return
-            step = (min(VIEWER_POINTS_PER_SECOND_MAX, VIEWER_POINTS_PER_SECOND_BASE * self.speed_slider.value()) *
-                (self.timer.interval() / 1000.0))
-            self.current_progress += step
-            if self.current_progress >= point_count - 1:
-                self.current_progress = 0.0
             self._update_panels()
 
         def _on_result_changed(self, index: int) -> None:
@@ -2510,15 +2792,19 @@ def run_interactive_viewer(payload_path: str) -> int:
                 self._reset_views()
                 return
             if key == QtCore.Qt.Key.Key_Left:
+                self._on_manual_range_change()
                 self.original_panel.pan_by_fraction(-0.08, 0.0)
                 return
             if key == QtCore.Qt.Key.Key_Right:
+                self._on_manual_range_change()
                 self.original_panel.pan_by_fraction(0.08, 0.0)
                 return
             if key == QtCore.Qt.Key.Key_Up:
+                self._on_manual_range_change()
                 self.original_panel.pan_by_fraction(0.0, 0.08)
                 return
             if key == QtCore.Qt.Key.Key_Down:
+                self._on_manual_range_change()
                 self.original_panel.pan_by_fraction(0.0, -0.08)
                 return
             super().keyPressEvent(event)
@@ -2574,6 +2860,128 @@ def build_trail_colors(count: int) -> List[str]:
         interpolate_color(start_rgb, end_rgb, index / (count - 1))
         for index in range(count)
     ]
+
+
+def build_viewer_sampling_levels(point_count: int) -> Tuple[int, ...]:
+    """Precompute a light-weight stride ladder for adaptive viewer sampling."""
+    safe_point_count = max(1, int(point_count))
+    levels: Set[int] = {1}
+    current = 1
+
+    while current < safe_point_count:
+        if current < 16:
+            current += 1
+        elif current < 128:
+            current += 4
+        elif current < 1024:
+            current += 16
+        else:
+            current += 64
+        levels.add(min(current, safe_point_count))
+
+    return tuple(sorted(levels))
+
+
+def choose_viewer_sampling_stride(
+    requested_count: int,
+    max_points: int,
+    stride_levels: Sequence[int],
+) -> int:
+    """Choose a monotone stride that fits the requested point budget."""
+    if requested_count <= max_points:
+        return 1
+
+    safe_requested = max(1, int(requested_count))
+    safe_budget = max(1, int(max_points))
+    ideal_stride = max(1, int(math.ceil((safe_requested - 1) / max(1, safe_budget - 1))))
+
+    for stride in stride_levels:
+        if stride >= ideal_stride:
+            return stride
+    return ideal_stride
+
+
+def sample_viewer_index_range(
+    start_index: int,
+    end_index: int,
+    max_points: int,
+    stride_levels: Sequence[int],
+) -> Tuple[int, ...]:
+    """Stride-sample an inclusive index range while keeping the first and last point."""
+    if max_points <= 0 or end_index < start_index:
+        return tuple()
+
+    requested_count = end_index - start_index + 1
+    safe_budget = max(1, int(max_points))
+    if requested_count <= safe_budget:
+        return tuple(range(start_index, end_index + 1))
+    if safe_budget == 1:
+        return (end_index,)
+
+    stride = choose_viewer_sampling_stride(requested_count, safe_budget, stride_levels)
+    indices = list(range(start_index, end_index + 1, stride))
+    if not indices or indices[0] != start_index:
+        indices.insert(0, start_index)
+    if indices[-1] != end_index:
+        indices.append(end_index)
+    return tuple(indices)
+
+
+def allocate_viewer_dynamic_marker_budget(
+    gray_requested: int,
+    gradient_requested: int,
+    total_budget: int,
+) -> Tuple[int, int]:
+    """Distribute one dynamic-marker budget across gray and gradient highlight layers."""
+    safe_gray_requested = max(0, int(gray_requested))
+    safe_gradient_requested = max(0, int(gradient_requested))
+    safe_total_budget = max(0, int(total_budget))
+    total_requested = safe_gray_requested + safe_gradient_requested
+
+    if safe_total_budget <= 0 or total_requested <= 0:
+        return 0, 0
+    if total_requested <= safe_total_budget:
+        return safe_gray_requested, safe_gradient_requested
+    if safe_gray_requested <= 0:
+        return 0, min(safe_gradient_requested, safe_total_budget)
+    if safe_gradient_requested <= 0:
+        return min(safe_gray_requested, safe_total_budget), 0
+
+    minimum_gray = min(safe_gray_requested, 2 if safe_gray_requested > 1 else 1)
+    minimum_gradient = min(safe_gradient_requested, 2 if safe_gradient_requested > 1 else 1)
+    minimum_total = minimum_gray + minimum_gradient
+    if minimum_total > safe_total_budget:
+        if safe_gradient_requested >= safe_gray_requested:
+            return max(0, safe_total_budget - 1), 1
+        return 1, max(0, safe_total_budget - 1)
+
+    gray_budget = minimum_gray
+    gradient_budget = minimum_gradient
+    remaining_budget = safe_total_budget - minimum_total
+    gray_remaining = safe_gray_requested - gray_budget
+    gradient_remaining = safe_gradient_requested - gradient_budget
+    remaining_requested = gray_remaining + gradient_remaining
+
+    if remaining_budget > 0 and remaining_requested > 0:
+        gray_extra = min(gray_remaining, int(round(remaining_budget * gray_remaining / remaining_requested)))
+        gradient_extra = min(gradient_remaining, int(round(remaining_budget * gradient_remaining / remaining_requested)))
+        gray_budget += gray_extra
+        gradient_budget += gradient_extra
+
+        used_budget = gray_budget + gradient_budget
+        leftover = safe_total_budget - used_budget
+        while leftover > 0:
+            gray_unmet = safe_gray_requested - gray_budget
+            gradient_unmet = safe_gradient_requested - gradient_budget
+            if gradient_unmet <= 0 and gray_unmet <= 0:
+                break
+            if gradient_unmet >= gray_unmet and gradient_unmet > 0:
+                gradient_budget += 1
+            elif gray_unmet > 0:
+                gray_budget += 1
+            leftover -= 1
+
+    return gray_budget, gradient_budget
 
 
 def compute_viewer_trail_ranges(
@@ -4559,6 +4967,12 @@ def run_self_tests() -> None:
     assert len(colors) == 4
     assert colors[0] == "#ffffff"
     assert colors[-1] == "#ff1010"
+    assert build_viewer_sampling_levels(20)[0] == 1
+    assert build_viewer_sampling_levels(20)[-1] == 20
+    assert sample_viewer_index_range(0, 9, 4, (1, 2, 3, 4, 5)) == (0, 3, 6, 9)
+    assert sample_viewer_index_range(3, 7, 10, (1, 2, 3)) == (3, 4, 5, 6, 7)
+    assert allocate_viewer_dynamic_marker_budget(30, 70, 20) == (7, 13)
+    assert allocate_viewer_dynamic_marker_budget(0, 70, 20) == (0, 20)
     assert compute_viewer_trail_ranges(10, 8, 6, 3) == ((3, 5), (6, 8))
     assert compute_viewer_trail_ranges(10, 2, 6, 5) == (None, (0, 2))
     assert compute_viewer_trail_ranges(10, 9, 20, 20) == (None, (0, 9))
