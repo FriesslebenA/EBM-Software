@@ -1,6 +1,7 @@
 .venv/
 build/
 dist/
+dist_temp/
 __pycache__/
 *.pyc
 _selftest_tmp/
@@ -9,3 +10,4 @@ _selftest_archive.zip
 _selftest_output.txt
 _selftest_output.zip
 sequence_viewer_payload_*.json
+.vscode/
