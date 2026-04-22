@@ -16,7 +16,7 @@ from collections import defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import tkinter as tk
@@ -33,6 +33,9 @@ MEMORY_DEFAULT = 4
 GRID_SPREAD_DEFAULT_SPACING = 0.1
 GRID_SPREAD_DEFAULT_RECENT_PERCENT = 10.0
 GRID_SPREAD_AGE_DECAY_DEFAULT = 0.9
+GHOST_BEAM_DEFAULT_DELAY = 2
+INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP = 3
+INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP = 2
 APP_DISPLAY_NAME = "Sequence optimiser"
 APP_BUILD_NAME = "SequenceOptimiser"
 VIEWER_PAYLOAD_PREFIX = "sequence_viewer_payload_"
@@ -41,6 +44,18 @@ VIEWER_POINTS_PER_SECOND_MAX = 3000.0
 VIEWER_TIMER_INTERVAL_MS = 33
 VIEWER_DEFAULT_GRADIENT_WINDOW = 1000
 VIEWER_PLAYBACK_GRADIENT_CAP = VIEWER_DEFAULT_GRADIENT_WINDOW
+DISPLAY_COORDINATE_SCALE_MM = 60.0
+BUILD_PLATE_WIDTH_MM = 120.0
+BUILD_PLATE_DEPTH_MM = 120.0
+DISPLAY_POINT_SPACING_MM = 0.1
+VIEWER_POINT_SIZE_MM_MIN = 0.05
+VIEWER_POINT_SIZE_MM_MAX = 5.0
+VIEWER_POINT_SIZE_MM_DEFAULT = DISPLAY_POINT_SPACING_MM
+VIEWER_POINT_SIZE_SLIDER_SCALE = 1000
+VIEWER_POINT_SIZE_INPUT_SCALE_UM = 1000.0
+VIEWER_VISITED_SIZE_MULTIPLIER = 1.15
+VIEWER_TRAIL_SIZE_MULTIPLIER = 1.35
+VIEWER_HEAD_SIZE_MULTIPLIER = 1.80
 VIEWER_BACKGROUND_COLOR = "#232323"
 VIEWER_VISITED_COLOR = "#666666"
 VIEWER_HEAD_COLOR = "#ff3030"
@@ -53,6 +68,9 @@ VIEWER_SLIDER_DRAG_INTERVAL_MS = max(1, int(round(1000 / VIEWER_SLIDER_DRAG_REFR
 MODE_PARAMETER_MEMORY = "memory"
 MODE_PARAMETER_GRID_SPACING = "grid_spacing"
 MODE_PARAMETER_RECENT_PERCENT = "recent_percent"
+MODE_PARAMETER_GHOST_DELAY = "ghost_delay"
+MODE_PARAMETER_FORWARD_JUMP = "forward_jump"
+MODE_PARAMETER_BACKWARD_JUMP = "backward_jump"
 ANIMATION_BASE_POINTS_PER_SECOND = 3.0
 ANIMATION_MIN_MULTIPLIER = 1
 ANIMATION_MAX_MULTIPLIER = 1000
@@ -109,6 +127,16 @@ VIEWER_EMPTY_RENDER_STATS = ViewerRenderStats(
 
 
 MODE_SPECS: Dict[str, ModeSpec] = {
+    "direct_visualisation": ModeSpec(
+        canonical_id="direct_visualisation",
+        label="Direct Visualisation (Unchanged)",
+        description=(
+            "This mode preserves the source sequence exactly as provided and performs no spatial reordering at all. "
+            "It is intended as a reference condition for direct visual inspection, metric comparison and viewer-based "
+            "analysis of the unmodified scan path."
+        ),
+        visible_parameters=(),
+    ),
     "local_greedy": ModeSpec(
         canonical_id="local_greedy",
         label="Local Greedy Optimisation",
@@ -158,6 +186,27 @@ MODE_SPECS: Dict[str, ModeSpec] = {
             "reduced clustering are scientifically preferable to strict deterministic repeatability."
         ),
         visible_parameters=(),
+    ),
+    "ghost_beam_scanning": ModeSpec(
+        canonical_id="ghost_beam_scanning",
+        label="Ghost Beam Scanning",
+        description=(
+            "This mode adapts the paper's primary and delayed secondary beam concept to the existing point cloud by "
+            "reordering only the already present points inside each detected stripe. A configurable ghost delay "
+            "interleaves forward-leading and delayed-following stripe segments to mimic local reheating behaviour "
+            "without generating any new exposure points."
+        ),
+        visible_parameters=(MODE_PARAMETER_GHOST_DELAY,),
+    ),
+    "interlaced_stripe_scanning": ModeSpec(
+        canonical_id="interlaced_stripe_scanning",
+        label="Interlaced Stripe Scanning",
+        description=(
+            "This mode preserves the stripe topology already encoded in the source sequence and only reorders points "
+            "within each detected stripe. The intra-stripe traversal is interlaced in deterministic forward/backward "
+            "jump blocks to reduce immediately adjacent consecutive exposures without duplicating any point."
+        ),
+        visible_parameters=(MODE_PARAMETER_FORWARD_JUMP, MODE_PARAMETER_BACKWARD_JUMP),
     ),
 }
 MODE_ALIASES = {
@@ -460,6 +509,49 @@ def load_points_from_input_source(source: Union[str, InputSource]) -> Tuple[List
 def dist(a: Point, b: Point) -> float:
     """Return the Euclidean distance between two points."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def scale_distance_for_display(distance_value: float, coordinate_scale: float = DISPLAY_COORDINATE_SCALE_MM) -> float:
+    """Convert one relative distance value into its displayed millimetre distance."""
+    return float(distance_value) * float(coordinate_scale)
+
+
+def scale_point_for_display(point: Point, coordinate_scale: float = DISPLAY_COORDINATE_SCALE_MM) -> Point:
+    """Convert one relative coordinate pair into displayed millimetres."""
+    return (
+        scale_distance_for_display(point[0], coordinate_scale),
+        scale_distance_for_display(point[1], coordinate_scale),
+    )
+
+
+def scale_points_for_display(points: Sequence[Point], coordinate_scale: float = DISPLAY_COORDINATE_SCALE_MM) -> List[Point]:
+    """Convert a point sequence into displayed millimetre coordinates."""
+    return [scale_point_for_display(point, coordinate_scale) for point in points]
+
+
+def clamp_viewer_point_size_mm(point_size_mm: float) -> float:
+    """Clamp the viewer point size to the supported metric range."""
+    return min(max(float(point_size_mm), VIEWER_POINT_SIZE_MM_MIN), VIEWER_POINT_SIZE_MM_MAX)
+
+
+def viewer_point_size_slider_to_mm(slider_value: int) -> float:
+    """Convert the point-size slider value into millimetres."""
+    return clamp_viewer_point_size_mm(float(slider_value) / VIEWER_POINT_SIZE_SLIDER_SCALE)
+
+
+def viewer_point_size_mm_to_slider(point_size_mm: float) -> int:
+    """Convert a metric point size into the slider range."""
+    return int(round(clamp_viewer_point_size_mm(point_size_mm) * VIEWER_POINT_SIZE_SLIDER_SCALE))
+
+
+def viewer_point_size_mm_to_input_um(point_size_mm: float) -> int:
+    """Convert the internal metric point size into the displayed micrometre value."""
+    return int(round(clamp_viewer_point_size_mm(point_size_mm) * VIEWER_POINT_SIZE_INPUT_SCALE_UM))
+
+
+def viewer_point_size_input_um_to_mm(point_size_um: float) -> float:
+    """Convert a displayed micrometre input back into internal millimetres."""
+    return clamp_viewer_point_size_mm(float(point_size_um) / VIEWER_POINT_SIZE_INPUT_SCALE_UM)
 
 
 def normalize_mode(mode: str) -> str:
@@ -824,6 +916,130 @@ def _weighted_random_choice(
     return candidate_ids[-1]
 
 
+def detect_source_stripe_ranges(points: Sequence[Point]) -> List[Tuple[int, int]]:
+    """Detect stripe boundaries from the original traversal by looking for large reverse reset jumps."""
+    point_count = len(points)
+    if point_count <= 0:
+        return []
+    if point_count == 1:
+        return [(0, 0)]
+
+    deltas_x = [points[index + 1][0] - points[index][0] for index in range(point_count - 1)]
+    deltas_y = [points[index + 1][1] - points[index][1] for index in range(point_count - 1)]
+    scan_axis = 0 if sum(abs(delta) for delta in deltas_x) >= sum(abs(delta) for delta in deltas_y) else 1
+    scan_deltas = deltas_x if scan_axis == 0 else deltas_y
+    nonzero_scan_deltas = [delta for delta in scan_deltas if abs(delta) > 1e-12]
+    if not nonzero_scan_deltas:
+        return [(0, point_count - 1)]
+
+    forward_direction = median(nonzero_scan_deltas)
+    if abs(forward_direction) <= 1e-12:
+        forward_direction = sum(nonzero_scan_deltas)
+    if abs(forward_direction) <= 1e-12:
+        forward_direction = nonzero_scan_deltas[0]
+    forward_sign = 1.0 if forward_direction >= 0.0 else -1.0
+
+    forward_steps = [abs(delta) for delta in nonzero_scan_deltas if delta * forward_sign > 0.0]
+    if forward_steps:
+        median_forward_step = float(median(forward_steps))
+    else:
+        median_forward_step = float(median(abs(delta) for delta in nonzero_scan_deltas))
+
+    scan_values = [point[scan_axis] for point in points]
+    scan_axis_span = max(scan_values) - min(scan_values)
+    reset_threshold = max(5.0 * median_forward_step, 0.02 * scan_axis_span, 1e-12)
+
+    stripe_ranges: List[Tuple[int, int]] = []
+    stripe_start = 0
+    for delta_index, delta_scan in enumerate(scan_deltas):
+        if delta_scan * forward_sign < 0.0 and abs(delta_scan) >= reset_threshold:
+            stripe_ranges.append((stripe_start, delta_index))
+            stripe_start = delta_index + 1
+
+    stripe_ranges.append((stripe_start, point_count - 1))
+    return stripe_ranges
+
+
+def detect_interlaced_stripe_ranges(points: Sequence[Point]) -> List[Tuple[int, int]]:
+    """Backward-compatible wrapper for the generic source-stripe detection."""
+    return detect_source_stripe_ranges(points)
+
+
+def build_interlaced_block_order(block_size: int, forward_jump: int) -> List[int]:
+    """Build the deterministic modular visit order for one full interlaced block."""
+    safe_block_size = max(1, int(block_size))
+    safe_forward_jump = max(1, int(forward_jump))
+    order: List[int] = []
+    seen: Set[int] = set()
+
+    for start_index in range(safe_block_size):
+        if start_index in seen:
+            continue
+        current_index = start_index
+        while current_index not in seen:
+            seen.add(current_index)
+            order.append(current_index)
+            current_index = (current_index + safe_forward_jump) % safe_block_size
+
+    return order
+
+
+def reorder_interlaced_stripe_indices(
+    stripe_indices: Sequence[int],
+    forward_jump: int,
+    backward_jump: int,
+) -> List[int]:
+    """Reorder one detected stripe blockwise without duplicating any point index."""
+    stripe_list = list(stripe_indices)
+    if not stripe_list:
+        return []
+
+    safe_forward_jump = max(1, int(forward_jump))
+    safe_backward_jump = max(1, int(backward_jump))
+    block_size = safe_forward_jump + safe_backward_jump
+    full_block_order = build_interlaced_block_order(block_size, safe_forward_jump)
+    reordered_indices: List[int] = []
+
+    for block_start in range(0, len(stripe_list), block_size):
+        block = stripe_list[block_start : block_start + block_size]
+        filtered_order = [position for position in full_block_order if position < len(block)]
+        reordered_indices.extend(block[position] for position in filtered_order)
+
+    return reordered_indices
+
+
+def reorder_ghost_beam_stripe_indices(
+    stripe_indices: Sequence[int],
+    ghost_delay: int,
+) -> List[int]:
+    """Interleave delayed stripe segments to mimic a primary/secondary ghost-beam traversal without duplicates."""
+    stripe_list = list(stripe_indices)
+    if not stripe_list:
+        return []
+
+    safe_delay = max(1, int(ghost_delay))
+    block_size = max(2, safe_delay * 2)
+    reordered_indices: List[int] = []
+
+    for block_start in range(0, len(stripe_list), block_size):
+        block = stripe_list[block_start : block_start + block_size]
+        if len(block) <= 1:
+            reordered_indices.extend(block)
+            continue
+
+        lag = min(safe_delay, len(block) - 1)
+        leading_segment = block[lag:]
+        trailing_segment = block[:lag]
+
+        for position in range(max(len(leading_segment), len(trailing_segment))):
+            if position < len(leading_segment):
+                reordered_indices.append(leading_segment[position])
+            if position < len(trailing_segment):
+                reordered_indices.append(trailing_segment[position])
+
+    return reordered_indices
+
+
 def optimize_path(
     points: List[Point],
     w1: float = W1_DEFAULT,
@@ -834,6 +1050,9 @@ def optimize_path(
     grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
     recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
     age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
+    forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
+    backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
     cancel_event: object = None,
 ) -> List[Point]:
     """Optimize point order with the selected strategy."""
@@ -854,10 +1073,79 @@ def optimize_path(
     if not 0.0 < age_decay <= 1.0:
         raise ValueError("age_decay muss zwischen 0 und 1 liegen.")
 
+    if ghost_delay < 1:
+        raise ValueError("ghost_delay muss mindestens 1 sein.")
+
+    if forward_jump < 1:
+        raise ValueError("forward_jump muss mindestens 1 sein.")
+
+    if backward_jump < 1:
+        raise ValueError("backward_jump muss mindestens 1 sein.")
+
+    if normalized_mode == "direct_visualisation":
+        if progress_callback is not None:
+            progress_callback(1.0, f"{len(points)} / {len(points)} Punkte unveraendert uebernommen")
+        return points.copy()
+
     if len(points) == 1:
         if progress_callback is not None:
             progress_callback(1.0, "1 / 1 Punkte optimiert")
         return points.copy()
+
+    if normalized_mode == "ghost_beam_scanning":
+        total_steps = len(points)
+        report_every = max(1, total_steps // 200)
+        optimized_indices: List[int] = []
+        stripe_ranges = detect_source_stripe_ranges(points)
+
+        for stripe_start, stripe_end in stripe_ranges:
+            raise_if_cancelled(cancel_event)
+            stripe_indices = list(range(stripe_start, stripe_end + 1))
+            optimized_indices.extend(
+                reorder_ghost_beam_stripe_indices(
+                    stripe_indices,
+                    ghost_delay=ghost_delay,
+                )
+            )
+            finished_steps = len(optimized_indices)
+            if (
+                progress_callback is not None
+                and (finished_steps == total_steps or finished_steps % report_every == 0)
+            ):
+                progress_callback(
+                    finished_steps / total_steps,
+                    f"{finished_steps} / {total_steps} Punkte mit {get_mode_label(normalized_mode)} optimiert",
+                )
+
+        return [points[point_id] for point_id in optimized_indices]
+
+    if normalized_mode == "interlaced_stripe_scanning":
+        total_steps = len(points)
+        report_every = max(1, total_steps // 200)
+        optimized_indices: List[int] = []
+        stripe_ranges = detect_source_stripe_ranges(points)
+
+        for stripe_start, stripe_end in stripe_ranges:
+            raise_if_cancelled(cancel_event)
+            stripe_indices = list(range(stripe_start, stripe_end + 1))
+            optimized_indices.extend(
+                reorder_interlaced_stripe_indices(
+                    stripe_indices,
+                    forward_jump=forward_jump,
+                    backward_jump=backward_jump,
+                )
+            )
+            finished_steps = len(optimized_indices)
+            if (
+                progress_callback is not None
+                and (finished_steps == total_steps or finished_steps % report_every == 0)
+            ):
+                progress_callback(
+                    finished_steps / total_steps,
+                    f"{finished_steps} / {total_steps} Punkte mit {get_mode_label(normalized_mode)} optimiert",
+                )
+
+        return [points[point_id] for point_id in optimized_indices]
 
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
@@ -1149,6 +1437,9 @@ def process_file(
     grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
     recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
     age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
+    forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
+    backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
     cancel_event: object = None,
 ) -> ProcessedFileResult:
     """Load, optimize and analyze one ABS file."""
@@ -1180,6 +1471,9 @@ def process_file(
         grid_spacing=grid_spacing,
         recent_percent=recent_percent,
         age_decay=age_decay,
+        ghost_delay=ghost_delay,
+        forward_jump=forward_jump,
+        backward_jump=backward_jump,
         cancel_event=cancel_event,
     )
     raise_if_cancelled(cancel_event)
@@ -1217,6 +1511,9 @@ def process_files(
     grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
     recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
     age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
+    forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
+    backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
 ) -> Tuple[List[ProcessedFileResult], List[str]]:
     """Process all selected files and collect readable errors."""
     results: List[ProcessedFileResult] = []
@@ -1233,6 +1530,9 @@ def process_files(
                 grid_spacing=grid_spacing,
                 recent_percent=recent_percent,
                 age_decay=age_decay,
+                ghost_delay=ghost_delay,
+                forward_jump=forward_jump,
+                backward_jump=backward_jump,
             )
         except Exception as exc:
             source_label = normalize_input_source(input_source).source_label
@@ -1309,13 +1609,15 @@ def save_results_as_zip(results: Sequence[ProcessedFileResult], zip_path: str) -
             used_output_names.add(target_name)
 
 
-def format_stats(stats: Stats) -> str:
+def format_stats(stats: Stats, distance_scale: float = 1.0, distance_unit: str = "") -> str:
     """Format jump statistics for console output and the GUI."""
+    safe_scale = float(distance_scale)
+    unit_suffix = str(distance_unit)
     return (
-        f"mean_jump : {stats['mean_jump']:.6f}\n"
-        f"max_jump  : {stats['max_jump']:.6f}\n"
-        f"min_jump  : {stats['min_jump']:.6f}\n"
-        f"std_jump  : {stats['std_jump']:.6f}\n"
+        f"mean_jump : {stats['mean_jump'] * safe_scale:.6f}{unit_suffix}\n"
+        f"max_jump  : {stats['max_jump'] * safe_scale:.6f}{unit_suffix}\n"
+        f"min_jump  : {stats['min_jump'] * safe_scale:.6f}{unit_suffix}\n"
+        f"std_jump  : {stats['std_jump'] * safe_scale:.6f}{unit_suffix}\n"
         f"count_jumps: {int(stats['count_jumps'])}"
     )
 
@@ -1495,8 +1797,11 @@ def ask_for_optimization_settings(
     current_memory: int,
     current_grid_spacing: float,
     current_recent_percent: float,
+    current_ghost_delay: int,
+    current_forward_jump: int,
+    current_backward_jump: int,
 ) -> Optional[Dict[str, object]]:
-    """Ask for the optimization mode and its mode-specific parameters."""
+    """Ask for the processing mode and its mode-specific parameters."""
     dialog = tk.Toplevel(parent)
     dialog.title(f"{APP_DISPLAY_NAME} - Modusauswahl")
     dialog.transient(parent)
@@ -1509,6 +1814,9 @@ def ask_for_optimization_settings(
     memory_var = tk.StringVar(value=str(current_memory))
     grid_spacing_var = tk.StringVar(value=f"{current_grid_spacing:.6g}")
     recent_percent_var = tk.StringVar(value=f"{current_recent_percent:.6g}")
+    ghost_delay_var = tk.StringVar(value=str(current_ghost_delay))
+    forward_jump_var = tk.StringVar(value=str(current_forward_jump))
+    backward_jump_var = tk.StringVar(value=str(current_backward_jump))
     help_var = tk.StringVar()
     parameter_hint_var = tk.StringVar()
     mode_labels = [MODE_SPECS[mode_id].label for mode_id in OPTIMIZATION_MODES]
@@ -1519,7 +1827,7 @@ def ask_for_optimization_settings(
 
     tk.Label(
         frame,
-        text="Waehlen Sie den Optimierungsmodus und die dazugehoerigen wissenschaftlichen Parameter.",
+        text="Waehlen Sie den Verarbeitungsmodus und die dazugehoerigen wissenschaftlichen Parameter.",
         bg="#1a1a1a",
         fg="#f0f0f0",
         font=("Segoe UI", 10, "bold"),
@@ -1552,6 +1860,33 @@ def ask_for_optimization_settings(
         to=100,
         increment=1,
         textvariable=recent_percent_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+    ghost_delay_label = tk.Label(form, text="Ghost delay (points)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    ghost_delay_spin = tk.Spinbox(
+        form,
+        from_=1,
+        to=9999,
+        textvariable=ghost_delay_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+    forward_jump_label = tk.Label(form, text="Forward jump", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    forward_jump_spin = tk.Spinbox(
+        form,
+        from_=1,
+        to=9999,
+        textvariable=forward_jump_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+    backward_jump_label = tk.Label(form, text="Backward jump", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    backward_jump_spin = tk.Spinbox(
+        form,
+        from_=1,
+        to=9999,
+        textvariable=backward_jump_var,
         width=12,
         font=("Segoe UI", 10),
     )
@@ -1598,15 +1933,39 @@ def ask_for_optimization_settings(
     )
     recent_percent_spin.grid(row=3, column=1, sticky="w", pady=4)
 
-    age_decay_label.grid(
+    ghost_delay_label.grid(
         row=4,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    ghost_delay_spin.grid(row=4, column=1, sticky="w", pady=4)
+
+    forward_jump_label.grid(
+        row=5,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    forward_jump_spin.grid(row=5, column=1, sticky="w", pady=4)
+
+    backward_jump_label.grid(
+        row=6,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    backward_jump_spin.grid(row=6, column=1, sticky="w", pady=4)
+
+    age_decay_label.grid(
+        row=7,
         column=0,
         columnspan=2,
         sticky="w",
         pady=(8, 0),
     )
     parameter_hint_label.grid(
-        row=5,
+        row=8,
         column=0,
         columnspan=2,
         sticky="w",
@@ -1650,6 +2009,24 @@ def ask_for_optimization_settings(
             else:
                 widget.grid_remove()
 
+        for widget in (ghost_delay_label, ghost_delay_spin):
+            if MODE_PARAMETER_GHOST_DELAY in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        for widget in (forward_jump_label, forward_jump_spin):
+            if MODE_PARAMETER_FORWARD_JUMP in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        for widget in (backward_jump_label, backward_jump_spin):
+            if MODE_PARAMETER_BACKWARD_JUMP in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
         if MODE_PARAMETER_GRID_SPACING in visible_parameters:
             age_decay_label.grid()
         else:
@@ -1667,9 +2044,6 @@ def ask_for_optimization_settings(
     def confirm() -> None:
         try:
             selected_mode = label_to_mode[mode_var.get()]
-        except ValueError:
-            messagebox.showerror("Pfadberechnung", "Bitte einen gueltigen Modus auswaehlen.", parent=dialog)
-            return
         except KeyError:
             messagebox.showerror("Pfadberechnung", "Bitte einen gueltigen Modus auswaehlen.", parent=dialog)
             return
@@ -1678,6 +2052,12 @@ def ask_for_optimization_settings(
         visible_parameters = set(spec.visible_parameters)
 
         memory_value = current_memory
+        grid_spacing = current_grid_spacing
+        recent_percent = current_recent_percent
+        ghost_delay_value = current_ghost_delay
+        forward_jump_value = current_forward_jump
+        backward_jump_value = current_backward_jump
+
         if MODE_PARAMETER_MEMORY in visible_parameters:
             try:
                 memory_value = int(memory_var.get())
@@ -1688,9 +2068,6 @@ def ask_for_optimization_settings(
         if MODE_PARAMETER_MEMORY in visible_parameters and memory_value < 0:
             messagebox.showerror("Pfadberechnung", "Memory darf nicht negativ sein.", parent=dialog)
             return
-
-        grid_spacing = current_grid_spacing
-        recent_percent = current_recent_percent
 
         if MODE_PARAMETER_GRID_SPACING in visible_parameters:
             try:
@@ -1713,12 +2090,45 @@ def ask_for_optimization_settings(
                 messagebox.showerror("Pfadberechnung", "Der Prozentwert muss zwischen 0 und 100 liegen.", parent=dialog)
                 return
 
+        if MODE_PARAMETER_GHOST_DELAY in visible_parameters:
+            try:
+                ghost_delay_value = int(ghost_delay_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte fuer Ghost delay eine ganze Zahl eingeben.", parent=dialog)
+                return
+            if ghost_delay_value < 1:
+                messagebox.showerror("Pfadberechnung", "Ghost delay muss mindestens 1 sein.", parent=dialog)
+                return
+
+        if MODE_PARAMETER_FORWARD_JUMP in visible_parameters:
+            try:
+                forward_jump_value = int(forward_jump_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte fuer Forward jump eine ganze Zahl eingeben.", parent=dialog)
+                return
+            if forward_jump_value < 1:
+                messagebox.showerror("Pfadberechnung", "Forward jump muss mindestens 1 sein.", parent=dialog)
+                return
+
+        if MODE_PARAMETER_BACKWARD_JUMP in visible_parameters:
+            try:
+                backward_jump_value = int(backward_jump_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte fuer Backward jump eine ganze Zahl eingeben.", parent=dialog)
+                return
+            if backward_jump_value < 1:
+                messagebox.showerror("Pfadberechnung", "Backward jump muss mindestens 1 sein.", parent=dialog)
+                return
+
         result["value"] = {
             "mode": spec.canonical_id,
             "memory": memory_value,
             "grid_spacing": grid_spacing,
             "recent_percent": recent_percent,
             "age_decay": GRID_SPREAD_AGE_DECAY_DEFAULT,
+            "ghost_delay": ghost_delay_value,
+            "forward_jump": forward_jump_value,
+            "backward_jump": backward_jump_value,
         }
         dialog.destroy()
 
@@ -2116,13 +2526,14 @@ def run_interactive_viewer(payload_path: str) -> int:
     class SequencePanel(QtWidgets.QWidget):
         """One scientific scatter view with static background and dynamic trail/head overlays."""
 
-        def __init__(self, title: str):
+        def __init__(self, title: str, coordinate_unit: str):
             super().__init__()
             self.points = np.empty((0, 2), dtype=float)
             self.trail_brush_cache: Dict[int, List[Any]] = {}
             self.last_render_key: Optional[Tuple[int, int, int, str]] = None
             self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
             self.current_gray_range: Optional[Tuple[int, int]] = None
+            self.point_size_mm = VIEWER_POINT_SIZE_MM_DEFAULT
 
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -2139,22 +2550,50 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.plot_widget.setMenuEnabled(False)
             self.plot_widget.showGrid(x=True, y=True, alpha=0.18)
             self.plot_widget.getPlotItem().hideButtons()
-            self.plot_widget.getPlotItem().setLabel("left", "Y")
-            self.plot_widget.getPlotItem().setLabel("bottom", "X")
+            self.plot_widget.getPlotItem().setLabel("left", f"Y ({coordinate_unit})")
+            self.plot_widget.getPlotItem().setLabel("bottom", f"X ({coordinate_unit})")
             self.plot_widget.getViewBox().setMouseEnabled(x=True, y=True)
             layout.addWidget(self.plot_widget, 1)
 
-            self.background_item = pg.ScatterPlotItem(size=5, pen=None, brush=pg.mkBrush(VIEWER_BACKGROUND_COLOR), pxMode=True)
-            self.visited_gray_item = pg.ScatterPlotItem(size=6, pen=None, brush=pg.mkBrush(VIEWER_VISITED_COLOR), pxMode=True)
-            self.trail_item = pg.ScatterPlotItem(size=8, pen=None, pxMode=True)
-            self.head_item = pg.ScatterPlotItem(size=12, pen=None, brush=pg.mkBrush(VIEWER_HEAD_COLOR), pxMode=True)
+            self.background_item = pg.ScatterPlotItem(
+                size=VIEWER_POINT_SIZE_MM_DEFAULT,
+                pen=None,
+                brush=pg.mkBrush(VIEWER_BACKGROUND_COLOR),
+                pxMode=False,
+            )
+            self.visited_gray_item = pg.ScatterPlotItem(
+                size=VIEWER_POINT_SIZE_MM_DEFAULT * VIEWER_VISITED_SIZE_MULTIPLIER,
+                pen=None,
+                brush=pg.mkBrush(VIEWER_VISITED_COLOR),
+                pxMode=False,
+            )
+            self.trail_item = pg.ScatterPlotItem(
+                size=VIEWER_POINT_SIZE_MM_DEFAULT * VIEWER_TRAIL_SIZE_MULTIPLIER,
+                pen=None,
+                pxMode=False,
+            )
+            self.head_item = pg.ScatterPlotItem(
+                size=VIEWER_POINT_SIZE_MM_DEFAULT * VIEWER_HEAD_SIZE_MULTIPLIER,
+                pen=None,
+                brush=pg.mkBrush(VIEWER_HEAD_COLOR),
+                pxMode=False,
+            )
             self.plot_widget.addItem(self.background_item)
             self.plot_widget.addItem(self.visited_gray_item)
             self.plot_widget.addItem(self.trail_item)
             self.plot_widget.addItem(self.head_item)
+            self.set_marker_size_mm(VIEWER_POINT_SIZE_MM_DEFAULT)
 
             self.point_label = QtWidgets.QLabel("Point 0 / 0")
             layout.addWidget(self.point_label)
+
+        def set_marker_size_mm(self, point_size_mm: float) -> None:
+            """Apply one base point size in millimetres to all viewer layers."""
+            self.point_size_mm = clamp_viewer_point_size_mm(point_size_mm)
+            self.background_item.setSize(self.point_size_mm)
+            self.visited_gray_item.setSize(self.point_size_mm * VIEWER_VISITED_SIZE_MULTIPLIER)
+            self.trail_item.setSize(self.point_size_mm * VIEWER_TRAIL_SIZE_MULTIPLIER)
+            self.head_item.setSize(self.point_size_mm * VIEWER_HEAD_SIZE_MULTIPLIER)
 
         def set_points(self, points: Any) -> None:
             self.points = points
@@ -2318,11 +2757,17 @@ def run_interactive_viewer(payload_path: str) -> int:
         def __init__(self, payload_data: Dict[str, Any]):
             super().__init__()
             self.payload = payload_data
+            self.coordinate_scale_mm = float(payload_data.get("coordinate_scale_mm", DISPLAY_COORDINATE_SCALE_MM))
+            self.coordinate_unit = str(payload_data.get("coordinate_unit", "mm"))
+            self.build_plate_width_mm = float(payload_data.get("build_plate_width_mm", BUILD_PLATE_WIDTH_MM))
+            self.build_plate_depth_mm = float(payload_data.get("build_plate_depth_mm", BUILD_PLATE_DEPTH_MM))
+            self.origin_reference = str(payload_data.get("origin_reference", "build_plate_centre"))
+            self.point_spacing_mm = float(payload_data.get("point_spacing_mm", DISPLAY_POINT_SPACING_MM))
             self.results = [
                 {
                     **item,
-                    "original_points_np": np.asarray(item["original_points"], dtype=float),
-                    "optimized_points_np": np.asarray(item["optimized_points"], dtype=float),
+                    "original_points_np": np.asarray(item["original_points"], dtype=float) * self.coordinate_scale_mm,
+                    "optimized_points_np": np.asarray(item["optimized_points"], dtype=float) * self.coordinate_scale_mm,
                 }
                 for item in payload_data["results"]
             ]
@@ -2337,6 +2782,7 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.playback_start_progress = 0.0
             self.playback_points_per_second = VIEWER_POINTS_PER_SECOND_BASE
             self.playback_elapsed = QtCore.QElapsedTimer()
+            self.point_size_mm = VIEWER_POINT_SIZE_MM_DEFAULT
 
             self.setWindowTitle(f"{payload_data.get('app_name', APP_DISPLAY_NAME)} - Interactive viewer")
             self.resize(1560, 920)
@@ -2410,6 +2856,27 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.gradient_label = QtWidgets.QLabel()
             control_row.addWidget(self.gradient_label)
 
+            control_row.addWidget(QtWidgets.QLabel("Point size"))
+            self.point_size_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            self.point_size_slider.setRange(
+                viewer_point_size_mm_to_slider(VIEWER_POINT_SIZE_MM_MIN),
+                viewer_point_size_mm_to_slider(VIEWER_POINT_SIZE_MM_MAX),
+            )
+            self.point_size_slider.setValue(viewer_point_size_mm_to_slider(self.point_size_mm))
+            self.point_size_slider.valueChanged.connect(self._on_point_size_slider_changed)
+            control_row.addWidget(self.point_size_slider)
+            self.point_size_input = QtWidgets.QSpinBox()
+            self.point_size_input.setRange(
+                viewer_point_size_mm_to_input_um(VIEWER_POINT_SIZE_MM_MIN),
+                viewer_point_size_mm_to_input_um(VIEWER_POINT_SIZE_MM_MAX),
+            )
+            self.point_size_input.setSingleStep(10)
+            self.point_size_input.setSuffix(" um")
+            self.point_size_input.setAccelerated(True)
+            self.point_size_input.setFixedWidth(124)
+            self.point_size_input.valueChanged.connect(self._on_point_size_input_changed)
+            control_row.addWidget(self.point_size_input)
+
             self.reset_button = QtWidgets.QPushButton("Home")
             self.reset_button.clicked.connect(self._reset_views)
             control_row.addWidget(self.reset_button)
@@ -2421,8 +2888,8 @@ def run_interactive_viewer(payload_path: str) -> int:
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
             outer_layout.addWidget(splitter, 1)
 
-            self.original_panel = SequencePanel("Original")
-            self.optimized_panel = SequencePanel("Optimised")
+            self.original_panel = SequencePanel("Original", self.coordinate_unit)
+            self.optimized_panel = SequencePanel("Optimised", self.coordinate_unit)
             splitter.addWidget(self.original_panel)
             splitter.addWidget(self.optimized_panel)
             splitter.setSizes([780, 780])
@@ -2443,6 +2910,8 @@ def run_interactive_viewer(payload_path: str) -> int:
             self._connect_synced_views()
             self._sync_speed_controls_from_slider()
             self._sync_trail_inputs()
+            self._sync_point_size_controls_from_slider()
+            self._apply_point_size_to_panels()
             self._update_render_feedback()
 
             initial_index = int(payload_data.get("selected_index", 0))
@@ -2547,6 +3016,19 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.gradient_input.setValue(gradient_window)
             self.gradient_input.blockSignals(False)
 
+        def _current_point_size_mm(self) -> float:
+            return viewer_point_size_slider_to_mm(self.point_size_slider.value())
+
+        def _sync_point_size_controls_from_slider(self) -> None:
+            self.point_size_mm = self._current_point_size_mm()
+            self.point_size_input.blockSignals(True)
+            self.point_size_input.setValue(viewer_point_size_mm_to_input_um(self.point_size_mm))
+            self.point_size_input.blockSignals(False)
+
+        def _apply_point_size_to_panels(self) -> None:
+            self.original_panel.set_marker_size_mm(self.point_size_mm)
+            self.optimized_panel.set_marker_size_mm(self.point_size_mm)
+
         def _update_render_feedback(self) -> None:
             trail_length = self.trail_slider.value()
             gradient_window = self.gradient_slider.value()
@@ -2604,6 +3086,7 @@ def run_interactive_viewer(payload_path: str) -> int:
 
             self.original_panel.set_points(result["original_points_np"])
             self.optimized_panel.set_points(result["optimized_points_np"])
+            self._apply_point_size_to_panels()
             self._reset_views()
             self._update_info_label()
             self._sync_trail_inputs()
@@ -2615,9 +3098,13 @@ def run_interactive_viewer(payload_path: str) -> int:
             result = self.results[self.current_index]
             archive_member = result.get("archive_member")
             source_hint = f"Archiv-Eintrag: {archive_member}" if archive_member else f"Quelle: {result['source_path']}"
+            origin_hint = "0,0 = plate centre" if self.origin_reference == "build_plate_centre" else self.origin_reference
             self.info_label.setText(
                 f"Mode: {self.payload.get('mode_label', '')} | {source_hint} | "
-                f"Output name: {result['output_name']} | Points: {result['point_count']}"
+                f"Output name: {result['output_name']} | Points: {result['point_count']} | "
+                f"Coordinates shown in {self.coordinate_unit} | {origin_hint} | "
+                f"Build plate: {self.build_plate_width_mm:.0f} x {self.build_plate_depth_mm:.0f} {self.coordinate_unit} | "
+                f"Point spacing: {self.point_spacing_mm:.1f} {self.coordinate_unit}"
             )
 
         def _points_per_second_from_slider_value(self, slider_value: int) -> float:
@@ -2679,6 +3166,20 @@ def run_interactive_viewer(payload_path: str) -> int:
             else:
                 self._sync_trail_inputs()
                 self._update_panels()
+
+        def _on_point_size_slider_changed(self, _value: int) -> None:
+            self._sync_point_size_controls_from_slider()
+            self._apply_point_size_to_panels()
+
+        def _on_point_size_input_changed(self, value: int) -> None:
+            point_size_mm = viewer_point_size_input_um_to_mm(value)
+            slider_value = viewer_point_size_mm_to_slider(point_size_mm)
+            if slider_value != self.point_size_slider.value():
+                self.point_size_slider.setValue(slider_value)
+            else:
+                self.point_size_mm = point_size_mm
+                self._sync_point_size_controls_from_slider()
+                self._apply_point_size_to_panels()
 
         def _on_heavy_slider_pressed(self) -> None:
             self.heavy_slider_drag_count += 1
@@ -3116,6 +3617,9 @@ def process_file_in_subprocess(
     grid_spacing: float = GRID_SPREAD_DEFAULT_SPACING,
     recent_percent: float = GRID_SPREAD_DEFAULT_RECENT_PERCENT,
     age_decay: float = GRID_SPREAD_AGE_DECAY_DEFAULT,
+    ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
+    forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
+    backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
     cancel_event: object = None,
 ) -> Tuple[int, int, str, ProcessedFileResult]:
     """Process one file in a separate process and forward progress messages."""
@@ -3136,6 +3640,9 @@ def process_file_in_subprocess(
         grid_spacing=grid_spacing,
         recent_percent=recent_percent,
         age_decay=age_decay,
+        ghost_delay=ghost_delay,
+        forward_jump=forward_jump,
+        backward_jump=backward_jump,
         cancel_event=cancel_event,
     )
     return (file_index, total_files, file_name, result)
@@ -3177,6 +3684,9 @@ class ComparisonApp(tk.Tk):
         grid_spacing: float,
         recent_percent: float,
         age_decay: float,
+        ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
+        forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
+        backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
     ):
         super().__init__()
         self.w1 = w1
@@ -3186,6 +3696,9 @@ class ComparisonApp(tk.Tk):
         self.grid_spacing = grid_spacing
         self.recent_percent = recent_percent
         self.age_decay = age_decay
+        self.ghost_delay = int(ghost_delay)
+        self.forward_jump = int(forward_jump)
+        self.backward_jump = int(backward_jump)
         self.zip_entry_type = "infill"
         self.zip_support_end_layer = 0
         self.initial_files = tuple(initial_files)
@@ -3885,6 +4398,9 @@ class ComparisonApp(tk.Tk):
             current_memory=self.memory,
             current_grid_spacing=self.grid_spacing,
             current_recent_percent=self.recent_percent,
+            current_ghost_delay=self.ghost_delay,
+            current_forward_jump=self.forward_jump,
+            current_backward_jump=self.backward_jump,
         )
         if settings is None:
             self.status_var.set("Dateiauswahl abgebrochen. Keine Verarbeitung gestartet.")
@@ -3896,6 +4412,9 @@ class ComparisonApp(tk.Tk):
         self.grid_spacing = float(settings["grid_spacing"])
         self.recent_percent = float(settings["recent_percent"])
         self.age_decay = float(settings["age_decay"])
+        self.ghost_delay = int(settings["ghost_delay"])
+        self.forward_jump = int(settings["forward_jump"])
+        self.backward_jump = int(settings["backward_jump"])
 
         input_sources: List[InputSource] = [normalize_input_source(file_path) for file_path in selected_files]
         if any(Path(file_path).suffix.lower() == ".zip" for file_path in selected_files):
@@ -4047,6 +4566,9 @@ class ComparisonApp(tk.Tk):
                 self.grid_spacing,
                 self.recent_percent,
                 self.age_decay,
+                self.ghost_delay,
+                self.forward_jump,
+                self.backward_jump,
                 self.process_cancel_event,
             )
             future.add_done_callback(
@@ -4286,6 +4808,12 @@ class ComparisonApp(tk.Tk):
             "mode_id": normalize_mode(self.mode),
             "mode_label": get_mode_label(self.mode),
             "mode_description": get_mode_spec(self.mode).description,
+            "coordinate_scale_mm": DISPLAY_COORDINATE_SCALE_MM,
+            "coordinate_unit": "mm",
+            "build_plate_width_mm": BUILD_PLATE_WIDTH_MM,
+            "build_plate_depth_mm": BUILD_PLATE_DEPTH_MM,
+            "origin_reference": "build_plate_centre",
+            "point_spacing_mm": DISPLAY_POINT_SPACING_MM,
             "selected_index": selected_index,
             "results": [
                 {
@@ -4473,15 +5001,28 @@ class ComparisonApp(tk.Tk):
         if MODE_PARAMETER_MEMORY in mode_spec.visible_parameters:
             parameter_lines.append(f"Memory: {self.memory}")
         if MODE_PARAMETER_GRID_SPACING in mode_spec.visible_parameters:
-            parameter_lines.append(f"Grid spacing: {self.grid_spacing:.6g}")
+            parameter_lines.append(
+                f"Grid spacing: {self.grid_spacing:.6g} rel (~ {scale_distance_for_display(self.grid_spacing):.6g} mm)"
+            )
         if MODE_PARAMETER_RECENT_PERCENT in mode_spec.visible_parameters:
             parameter_lines.append(f"Recent set: {self.recent_percent:.1f}%")
             parameter_lines.append(f"Age decay (fixed): {self.age_decay:.2f}")
+        if MODE_PARAMETER_GHOST_DELAY in mode_spec.visible_parameters:
+            parameter_lines.append(f"Ghost delay: {self.ghost_delay} points")
+        if MODE_PARAMETER_FORWARD_JUMP in mode_spec.visible_parameters:
+            parameter_lines.append(f"Forward jump: {self.forward_jump}")
+        if MODE_PARAMETER_BACKWARD_JUMP in mode_spec.visible_parameters:
+            parameter_lines.append(f"Backward jump: {self.backward_jump}")
         if not parameter_lines:
             parameter_lines.append("Zusaetzliche Parameter: keine")
 
         current_zip_name = build_default_zip_name([self.current_result], self.mode)
         viewer_hint = "Interaktiver Viewer: separates Qt/PyQtGraph-Fenster fuer Zoom, Panning und Animation."
+        coordinate_hint = (
+            f"Anzeige in mm: x/y = ABS * {DISPLAY_COORDINATE_SCALE_MM:.0f} | "
+            f"0,0 = Mittelpunkt | Bauplatte: {BUILD_PLATE_WIDTH_MM:.0f} x {BUILD_PLATE_DEPTH_MM:.0f} mm | "
+            f"Punktabstand: {DISPLAY_POINT_SPACING_MM:.1f} mm"
+        )
         self.file_info_label.config(
             text=(
                 "\n".join(source_lines)
@@ -4495,11 +5036,31 @@ class ComparisonApp(tk.Tk):
                 + "\n".join(parameter_lines)
                 + "\n"
                 + f"Beschreibung: {mode_spec.description}\n"
+                + coordinate_hint
+                + "\n"
                 + viewer_hint
             )
         )
-        self.original_stats_label.config(text="Original\n--------\n" + format_stats(self.current_result.original_stats))
-        self.optimized_stats_label.config(text="Optimised\n---------\n" + format_stats(self.current_result.optimized_stats))
+        self.original_stats_label.config(
+            text=(
+                "Original\n--------\n"
+                + format_stats(
+                    self.current_result.original_stats,
+                    distance_scale=DISPLAY_COORDINATE_SCALE_MM,
+                    distance_unit=" mm",
+                )
+            )
+        )
+        self.optimized_stats_label.config(
+            text=(
+                "Optimised\n---------\n"
+                + format_stats(
+                    self.current_result.optimized_stats,
+                    distance_scale=DISPLAY_COORDINATE_SCALE_MM,
+                    distance_unit=" mm",
+                )
+            )
+        )
 
         self.status_var.set(f"Ergebnis aktiv: {self.current_result.source_label}")
         self.preview_button.config(state="normal")
@@ -4926,11 +5487,29 @@ def run_self_tests() -> None:
     assert normalize_mode("basic") == "local_greedy"
     assert normalize_mode("greedy") == "local_greedy"
     assert normalize_mode("random_noise") == "density_adaptive_sampling"
+    assert normalize_mode("direct_visualisation") == "direct_visualisation"
+    assert normalize_mode("ghost_beam_scanning") == "ghost_beam_scanning"
+    assert normalize_mode("interlaced_stripe_scanning") == "interlaced_stripe_scanning"
+    assert get_mode_label("direct_visualisation") == "Direct Visualisation (Unchanged)"
+    assert get_mode_label("ghost_beam_scanning") == "Ghost Beam Scanning"
     assert get_mode_label("spread") == "Dispersion Maximisation"
+    assert get_mode_label("interlaced_stripe_scanning") == "Interlaced Stripe Scanning"
     assert build_output_name_for_source(
         InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
         "local_greedy",
     ) == "sample_abs_input_optimised_local_greedy.txt"
+    assert build_output_name_for_source(
+        InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
+        "direct_visualisation",
+    ) == "sample_abs_input_optimised_direct_visualisation.txt"
+    assert build_output_name_for_source(
+        InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
+        "ghost_beam_scanning",
+    ) == "sample_abs_input_optimised_ghost_beam_scanning.txt"
+    assert build_output_name_for_source(
+        InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
+        "interlaced_stripe_scanning",
+    ) == "sample_abs_input_optimised_interlaced_stripe_scanning.txt"
     assert parse_b99_archive_entry_name("12021.B99") == (12, "infill")
     assert parse_b99_archive_entry_name("12031.B99") == (12, "boundary")
     assert parse_b99_archive_entry_name("12091.B99") == (12, "combo")
@@ -4946,12 +5525,28 @@ def run_self_tests() -> None:
     assert set(seeded_candidates).issubset(set(range(10)))
     assert len(sample_points_for_preview([(float(index), 0.0) for index in range(100)], max_points=10)) <= 11
     assert compute_point_bounds([(0.0, 1.0), (2.0, 3.0), (-1.0, 4.0)]) == (-1.0, 2.0, 1.0, 4.0)
+    assert math.isclose(scale_distance_for_display(1.0), 60.0, rel_tol=0.0, abs_tol=1e-12)
+    assert scale_point_for_display((-1.0, -1.0)) == (-60.0, -60.0)
+    assert scale_point_for_display((0.0, 0.0)) == (0.0, 0.0)
+    assert scale_point_for_display((1.0, 1.0)) == (60.0, 60.0)
+    assert scale_points_for_display([(0.0, 0.0), (1.0, 1.0)]) == [(0.0, 0.0), (60.0, 60.0)]
+    assert math.isclose(clamp_viewer_point_size_mm(0.01), VIEWER_POINT_SIZE_MM_MIN, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(clamp_viewer_point_size_mm(10.0), VIEWER_POINT_SIZE_MM_MAX, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(VIEWER_POINT_SIZE_MM_DEFAULT, DISPLAY_POINT_SPACING_MM, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(viewer_point_size_slider_to_mm(125), 0.125, rel_tol=0.0, abs_tol=1e-12)
+    assert viewer_point_size_mm_to_slider(1.25) == 1250
+    assert viewer_point_size_mm_to_input_um(0.1) == 100
+    assert math.isclose(viewer_point_size_input_um_to_mm(100), 0.1, rel_tol=0.0, abs_tol=1e-12)
 
     stats = analyze_path([(0.0, 0.0), (3.0, 4.0), (6.0, 8.0)])
     assert math.isclose(stats["mean_jump"], 5.0, rel_tol=0.0, abs_tol=1e-12)
     assert math.isclose(stats["max_jump"], 5.0, rel_tol=0.0, abs_tol=1e-12)
     assert math.isclose(stats["min_jump"], 5.0, rel_tol=0.0, abs_tol=1e-12)
     assert int(stats["count_jumps"]) == 2
+    formatted_stats_mm = format_stats(stats, distance_scale=DISPLAY_COORDINATE_SCALE_MM, distance_unit=" mm")
+    assert "mean_jump : 300.000000 mm" in formatted_stats_mm
+    assert "std_jump  : 0.000000 mm" in formatted_stats_mm
+    assert "count_jumps: 2" in formatted_stats_mm
     assert format_duration(65.4, include_tenths=True) == "00:01:05.4"
 
     plan = build_animation_plan(point_count=10, speed_multiplier=1)
@@ -4979,6 +5574,124 @@ def run_self_tests() -> None:
     assert build_gradient_bin_ranges(0, 9, 4) == [(0, 1), (2, 4), (5, 6), (7, 9)]
     assert inclusive_range_difference((3, 7), (1, 4)) == [(5, 7)]
     assert inclusive_range_difference((3, 7), None) == [(3, 7)]
+    assert build_interlaced_block_order(5, 3) == [0, 3, 1, 4, 2]
+    assert build_interlaced_block_order(6, 4) == [0, 4, 2, 1, 5, 3]
+    assert reorder_ghost_beam_stripe_indices([0, 1, 2, 3], 2) == [2, 0, 3, 1]
+    assert reorder_ghost_beam_stripe_indices([0, 1, 2, 3, 4, 5], 3) == [3, 0, 4, 1, 5, 2]
+    assert reorder_interlaced_stripe_indices([0, 1, 2, 3, 4], 3, 2) == [0, 3, 1, 4, 2]
+    assert reorder_interlaced_stripe_indices([0, 1, 2, 3], 3, 2) == [0, 3, 1, 2]
+    direct_points = [(0.0, 0.0), (1.0, 1.0), (2.0, 0.5)]
+    direct_result = optimize_path(direct_points, mode="direct_visualisation")
+    assert direct_result == direct_points
+    assert direct_result is not direct_points
+    interlaced_detection_points = [
+        (-1.20, 0.0),
+        (-1.10, 0.0),
+        (-1.00, 0.0),
+        (-2.00, 1.0),
+        (-1.90, 1.0),
+        (-1.80, 1.0),
+    ]
+    assert detect_source_stripe_ranges(interlaced_detection_points) == [(0, 2), (3, 5)]
+    assert detect_interlaced_stripe_ranges(interlaced_detection_points) == [(0, 2), (3, 5)]
+    ghost_points = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (2.0, 0.0),
+        (3.0, 0.0),
+        (-10.0, 1.0),
+        (-9.0, 1.0),
+        (-8.0, 1.0),
+        (-7.0, 1.0),
+    ]
+    ghost_result = optimize_path(
+        ghost_points,
+        mode="ghost_beam_scanning",
+        ghost_delay=2,
+    )
+    assert ghost_result == [
+        ghost_points[2],
+        ghost_points[0],
+        ghost_points[3],
+        ghost_points[1],
+        ghost_points[6],
+        ghost_points[4],
+        ghost_points[7],
+        ghost_points[5],
+    ]
+    assert sorted(ghost_result) == sorted(ghost_points)
+    interlaced_points = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (2.0, 0.0),
+        (3.0, 0.0),
+        (4.0, 0.0),
+        (-10.0, 1.0),
+        (-9.0, 1.0),
+        (-8.0, 1.0),
+        (-7.0, 1.0),
+        (-6.0, 1.0),
+    ]
+    interlaced_result = optimize_path(
+        interlaced_points,
+        mode="interlaced_stripe_scanning",
+        forward_jump=3,
+        backward_jump=2,
+    )
+    assert interlaced_result == [
+        interlaced_points[0],
+        interlaced_points[3],
+        interlaced_points[1],
+        interlaced_points[4],
+        interlaced_points[2],
+        interlaced_points[5],
+        interlaced_points[8],
+        interlaced_points[6],
+        interlaced_points[9],
+        interlaced_points[7],
+    ]
+    assert sorted(interlaced_result) == sorted(interlaced_points)
+    try:
+        optimize_path(interlaced_points, mode="interlaced_stripe_scanning", forward_jump=0, backward_jump=2)
+    except ValueError as exc:
+        assert "forward_jump" in str(exc)
+    else:
+        raise AssertionError("forward_jump=0 sollte fehlschlagen.")
+    try:
+        optimize_path(interlaced_points, mode="interlaced_stripe_scanning", forward_jump=3, backward_jump=0)
+    except ValueError as exc:
+        assert "backward_jump" in str(exc)
+    else:
+        raise AssertionError("backward_jump=0 sollte fehlschlagen.")
+    try:
+        optimize_path(ghost_points, mode="ghost_beam_scanning", ghost_delay=0)
+    except ValueError as exc:
+        assert "ghost_delay" in str(exc)
+    else:
+        raise AssertionError("ghost_delay=0 sollte fehlschlagen.")
+
+    payload_test_result = ProcessedFileResult(
+        source_path=Path("payload_test.txt"),
+        source_label="payload_test.txt",
+        archive_member=None,
+        output_name="payload_test_optimised_local_greedy.txt",
+        original_lines=["ABS 0.0 0.0", "ABS 1.0 1.0"],
+        original_points=[(0.0, 0.0), (1.0, 1.0)],
+        optimized_points=[(1.0, 1.0), (0.0, 0.0)],
+        original_stats=stats,
+        optimized_stats=stats,
+        output_text="ABS 1.0 1.0\nABS 0.0 0.0\n",
+        processing_seconds=0.1,
+    )
+    payload_app = ComparisonApp.__new__(ComparisonApp)
+    payload_app.mode = "local_greedy"
+    payload_app.results = [payload_test_result]
+    viewer_payload = ComparisonApp._build_viewer_payload(payload_app, 0)
+    assert math.isclose(viewer_payload["coordinate_scale_mm"], DISPLAY_COORDINATE_SCALE_MM, rel_tol=0.0, abs_tol=1e-12)
+    assert viewer_payload["coordinate_unit"] == "mm"
+    assert viewer_payload["origin_reference"] == "build_plate_centre"
+    assert math.isclose(viewer_payload["point_spacing_mm"], DISPLAY_POINT_SPACING_MM, rel_tol=0.0, abs_tol=1e-12)
+    assert viewer_payload["results"][0]["original_points"] == [[0.0, 0.0], [1.0, 1.0]]
 
     grid_spread_points = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.1, 0.1)]
     grid_spread_result = optimize_path(
@@ -5160,6 +5873,24 @@ def main() -> None:
         default=GRID_SPREAD_AGE_DECAY_DEFAULT,
         help="Altersabwaegung fuer die Grid-Dispersion-Modi. 1.0 = kein Abfall.",
     )
+    parser.add_argument(
+        "--ghost-delay",
+        type=int,
+        default=GHOST_BEAM_DEFAULT_DELAY,
+        help="Punktbasierte Verzoegerung fuer den adaptierten Ghost-Beam-Modus innerhalb eines Streifens.",
+    )
+    parser.add_argument(
+        "--forward-jump",
+        type=int,
+        default=INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
+        help="Vorwaertssprung innerhalb eines Streifenblocks fuer Interlaced Stripe Scanning.",
+    )
+    parser.add_argument(
+        "--backward-jump",
+        type=int,
+        default=INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
+        help="Rueckwaertssprung-Anteil fuer die Blockgroesse bei Interlaced Stripe Scanning.",
+    )
     args = parser.parse_args()
 
     if args.viewer_payload:
@@ -5181,6 +5912,9 @@ def main() -> None:
             grid_spacing=args.grid_spacing,
             recent_percent=args.recent_percent,
             age_decay=args.age_decay,
+            ghost_delay=args.ghost_delay,
+            forward_jump=args.forward_jump,
+            backward_jump=args.backward_jump,
         )
         app.mainloop()
     except tk.TclError as exc:
