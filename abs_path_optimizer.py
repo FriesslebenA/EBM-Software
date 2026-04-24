@@ -378,9 +378,17 @@ def _build_plain_output_name(file_name: str, mode: str) -> str:
     return f"{stem}_optimised_{spec.canonical_id}{name_path.suffix}"
 
 
+def _archive_member_keeps_original_name(archive_member: str) -> bool:
+    """Return whether one archive member must keep its original file name."""
+    member_path = PurePosixPath(str(archive_member).replace("\\", "/"))
+    return any(part.casefold() == "figure files" for part in member_path.parent.parts)
+
+
 def build_output_name_for_source(input_source: "InputSource", mode: str) -> str:
     """Build the output member/file name while preserving ZIP parent folders."""
     if input_source.archive_member:
+        if _archive_member_keeps_original_name(input_source.archive_member):
+            return input_source.archive_member
         member_path = PurePosixPath(input_source.archive_member)
         renamed_member = _build_plain_output_name(member_path.name, mode)
         if str(member_path.parent) == ".":
@@ -5510,6 +5518,29 @@ def run_self_tests() -> None:
         InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
         "interlaced_stripe_scanning",
     ) == "sample_abs_input_optimised_interlaced_stripe_scanning.txt"
+    assert _archive_member_keeps_original_name("figure files/37091.B99") is True
+    assert _archive_member_keeps_original_name("Figure Files/37091.B99") is True
+    assert _archive_member_keeps_original_name("inner/37091.B99") is False
+    assert build_output_name_for_source(
+        InputSource(
+            "zip_entry",
+            "sample.zip",
+            "sample.zip :: figure files/37091.B99",
+            "figure files/37091.B99",
+            "figure files/37091.B99",
+        ),
+        "density_adaptive_sampling",
+    ) == "figure files/37091.B99"
+    assert build_output_name_for_source(
+        InputSource(
+            "zip_entry",
+            "sample.zip",
+            "sample.zip :: inner/01021.B99",
+            "inner/01021.B99",
+            "inner/01021.B99",
+        ),
+        "density_adaptive_sampling",
+    ) == "inner/01021_optimised_density_adaptive_sampling.B99"
     assert parse_b99_archive_entry_name("12021.B99") == (12, "infill")
     assert parse_b99_archive_entry_name("12031.B99") == (12, "boundary")
     assert parse_b99_archive_entry_name("12091.B99") == (12, "combo")
@@ -5748,6 +5779,7 @@ def run_self_tests() -> None:
             archive.writestr("inner/01021.B99", "ABS 0.0 0.0\nABS 1.0 1.0\n")
             archive.writestr("inner/02031.B99", "ABS 2.0 2.0\nABS 3.0 3.0\n")
             archive.writestr("inner/00021.B99", "ABS 9.0 9.0\n")
+            archive.writestr("figure files/37091.B99", "ABS 0.0 0.0\nABS 2.0 2.0\n")
             archive.writestr("inner/readme.txt", "ignored\n")
 
         input_sources, source_errors = build_input_sources(
@@ -5814,12 +5846,35 @@ def run_self_tests() -> None:
                 "inner/01021_optimised_local_greedy.B99",
                 "inner/02031.B99",
                 "inner/00021.B99",
+                "figure files/37091.B99",
                 "inner/readme.txt",
             }
             optimized_member = archive.read("inner/01021_optimised_local_greedy.B99").decode("utf-8")
             untouched_member = archive.read("inner/02031.B99").decode("utf-8")
             assert optimized_member == processed_zip_result.output_text
             assert untouched_member == "ABS 2.0 2.0\nABS 3.0 3.0\n"
+
+        combo_input_sources, combo_source_errors = build_input_sources(
+            [str(archive_input_path)],
+            zip_entry_type="combo",
+            zip_support_end_layer=0,
+        )
+        assert not combo_source_errors
+        assert len(combo_input_sources) == 1
+        assert combo_input_sources[0].archive_member == "figure files/37091.B99"
+        processed_combo_result = process_file(
+            combo_input_sources[0],
+            w1=W1_DEFAULT,
+            w2=W2_DEFAULT,
+            memory=MEMORY_DEFAULT,
+            mode="random_noise",
+        )
+        assert processed_combo_result.output_name == "figure files/37091.B99"
+        save_results_as_zip([processed_combo_result], str(zip_path))
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            assert "figure files/37091.B99" in archive.namelist()
+            assert not any(name.startswith("figure files/37091_optimised_") for name in archive.namelist())
         assert build_default_zip_name([worker_result], "local_greedy") == "_selftest_sample_abs_optimised_local_greedy.zip"
     finally:
         for path in (input_path, archive_input_path, output_path, zip_path):
