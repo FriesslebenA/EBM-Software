@@ -12,17 +12,15 @@ def safe_collect(collector, package_name):
 
 hiddenimports = [
     "numpy",
-    "pyqtgraph",
     "PySide6",
     "PySide6.QtCore",
     "PySide6.QtGui",
+    "PySide6.QtOpenGL",
+    "PySide6.QtOpenGLWidgets",
     "PySide6.QtWidgets",
     "shiboken6",
 ]
-datas = (
-    safe_collect(collect_data_files, "pyqtgraph")
-    + safe_collect(collect_data_files, "PySide6")
-)
+datas = safe_collect(collect_data_files, "PySide6")
 binaries = (
     safe_collect(collect_dynamic_libs, "PySide6")
     + safe_collect(collect_dynamic_libs, "shiboken6")

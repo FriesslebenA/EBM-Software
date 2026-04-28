@@ -21,15 +21,26 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "dist\SequenceOptimiser.exe" (
+echo.
+echo Baue StepLayerGenerator...
+call build_step_layer_generator.bat
+if errorlevel 1 (
+    echo.
+    echo Fehler: StepLayerGenerator-Build fehlgeschlagen.
+    pause
+    exit /b 1
+)
+
+if exist "dist\SequenceOptimiser.exe" if exist "dist\StepLayerGenerator.exe" (
     echo.
     echo Erzeuge ZIP-Paket...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\\SequenceOptimiser.exe' -DestinationPath 'dist\\SequenceOptimiser_portable.zip' -Force"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\\SequenceOptimiser.exe','dist\\StepLayerGenerator.exe' -DestinationPath 'dist\\SequenceOptimiser_portable.zip' -Force"
 )
 
 echo.
 echo Fertig.
 echo EXE: dist\SequenceOptimiser.exe
+if exist "dist\StepLayerGenerator.exe" echo STEP-Helper: dist\StepLayerGenerator.exe
 if exist "dist\SequenceOptimiser_portable.zip" echo ZIP: dist\SequenceOptimiser_portable.zip
 echo.
 pause

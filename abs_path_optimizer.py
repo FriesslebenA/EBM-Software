@@ -6,6 +6,7 @@ import os
 import queue
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,7 @@ import time
 import zipfile
 from array import array
 from collections import defaultdict
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from statistics import mean, median, pstdev
@@ -48,6 +49,9 @@ DISPLAY_COORDINATE_SCALE_MM = 60.0
 BUILD_PLATE_WIDTH_MM = 120.0
 BUILD_PLATE_DEPTH_MM = 120.0
 DISPLAY_POINT_SPACING_MM = 0.1
+STEP_POINT_SPACING_MM_DEFAULT = DISPLAY_POINT_SPACING_MM
+STEP_LAYER_HEIGHT_MM_DEFAULT = 0.1
+STEP_SUPPORT_LAYER_COUNT_DEFAULT = 0
 VIEWER_POINT_SIZE_MM_MIN = 0.05
 VIEWER_POINT_SIZE_MM_MAX = 5.0
 VIEWER_POINT_SIZE_MM_DEFAULT = DISPLAY_POINT_SPACING_MM
@@ -62,6 +66,8 @@ VIEWER_HEAD_COLOR = "#ff3030"
 VIEWER_NAVIGATION_DYNAMIC_MARKERS = 750
 VIEWER_PLAYBACK_DYNAMIC_MARKERS = 2000
 VIEWER_IDLE_DYNAMIC_MARKERS = 10000
+VIEWER_NAVIGATION_BACKGROUND_MARKERS = 2500
+VIEWER_PLAYBACK_BACKGROUND_MARKERS = 6000
 VIEWER_AUTO_RESUME_DELAY_MS = 300
 VIEWER_SLIDER_DRAG_REFRESH_HZ = 10
 VIEWER_SLIDER_DRAG_INTERVAL_MS = max(1, int(round(1000 / VIEWER_SLIDER_DRAG_REFRESH_HZ)))
@@ -84,11 +90,15 @@ VISITED_POINT_HALF_SIZE = 2
 HEAD_POINT_RADIUS = 5
 ZIP_ENTRY_NAME_PATTERN = re.compile(r"^(\d+)0(\d)1$", re.IGNORECASE)
 ZIP_ENTRY_TYPES = ("infill", "boundary", "combo")
+STEP_GENERATED_ZIP_ENTRY_TYPES = ("infill", "boundary")
 ZIP_ENTRY_TYPE_LABELS = {
     "infill": "Infill",
     "boundary": "Boundary",
     "combo": "Kombi",
 }
+STEP_HELPER_BUILD_NAME = "StepLayerGenerator"
+STEP_HELPER_SOURCE_PYTHON = "3.12"
+STEP_HELPER_CADQUERY_SPEC = "cadquery==2.7.0"
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,7 @@ class ModeSpec:
 class ViewerRenderPolicy:
     name: str
     dynamic_marker_budget: int
+    background_marker_budget: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -114,9 +125,17 @@ class ViewerRenderStats:
     policy_name: str
 
 
-VIEWER_RENDER_POLICY_NAVIGATION = ViewerRenderPolicy("navigation", VIEWER_NAVIGATION_DYNAMIC_MARKERS)
-VIEWER_RENDER_POLICY_PLAYBACK = ViewerRenderPolicy("playback", VIEWER_PLAYBACK_DYNAMIC_MARKERS)
-VIEWER_RENDER_POLICY_IDLE = ViewerRenderPolicy("idle_refine", VIEWER_IDLE_DYNAMIC_MARKERS)
+VIEWER_RENDER_POLICY_NAVIGATION = ViewerRenderPolicy(
+    "navigation",
+    VIEWER_NAVIGATION_DYNAMIC_MARKERS,
+    VIEWER_NAVIGATION_BACKGROUND_MARKERS,
+)
+VIEWER_RENDER_POLICY_PLAYBACK = ViewerRenderPolicy(
+    "playback",
+    VIEWER_PLAYBACK_DYNAMIC_MARKERS,
+    VIEWER_PLAYBACK_BACKGROUND_MARKERS,
+)
+VIEWER_RENDER_POLICY_IDLE = ViewerRenderPolicy("idle_refine", VIEWER_IDLE_DYNAMIC_MARKERS, None)
 VIEWER_EMPTY_RENDER_STATS = ViewerRenderStats(
     requested_trail_count=0,
     requested_gradient_count=0,
@@ -263,6 +282,14 @@ class InputSource:
     archive_member: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class StepGeneratedArtifact:
+    source_step_path: Path
+    generated_zip_path: Path
+    manifest_json_path: Path
+    manifest_data: Dict[str, Any]
+
+
 class CancelledWorkError(RuntimeError):
     """Raised when a background calculation was cancelled by the user."""
 
@@ -378,9 +405,17 @@ def _build_plain_output_name(file_name: str, mode: str) -> str:
     return f"{stem}_optimised_{spec.canonical_id}{name_path.suffix}"
 
 
+def _archive_member_keeps_original_name(archive_member: str) -> bool:
+    """Return whether one archive member must keep its original file name."""
+    member_path = PurePosixPath(str(archive_member).replace("\\", "/"))
+    return any(part.casefold() == "figure files" for part in member_path.parent.parts)
+
+
 def build_output_name_for_source(input_source: "InputSource", mode: str) -> str:
     """Build the output member/file name while preserving ZIP parent folders."""
     if input_source.archive_member:
+        if _archive_member_keeps_original_name(input_source.archive_member):
+            return input_source.archive_member
         member_path = PurePosixPath(input_source.archive_member)
         renamed_member = _build_plain_output_name(member_path.name, mode)
         if str(member_path.parent) == ".":
@@ -416,6 +451,129 @@ def normalize_input_source(source: Union[str, InputSource]) -> InputSource:
     )
 
 
+def normalize_zip_entry_types(zip_entry_types: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+    """Normalize one or many ZIP entry types while preserving the configured display order."""
+    if zip_entry_types is None:
+        normalized = ("infill",)
+    else:
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for entry_type in zip_entry_types:
+            safe_type = str(entry_type)
+            if safe_type not in ZIP_ENTRY_TYPES or safe_type in seen:
+                continue
+            seen.add(safe_type)
+            ordered.append(safe_type)
+        normalized = tuple(ordered)
+
+    if not normalized:
+        raise ValueError("Mindestens ein ZIP-Eintragstyp muss ausgewaehlt sein.")
+    return normalized
+
+
+def is_step_file_path(file_path: Union[str, Path]) -> bool:
+    return Path(file_path).suffix.lower() in {".step", ".stp"}
+
+
+def _step_helper_source_script_path() -> Path:
+    return Path(__file__).resolve().with_name("step_layer_generator.py")
+
+
+def _step_helper_executable_path() -> Path:
+    return Path(sys.executable).resolve().with_name(f"{STEP_HELPER_BUILD_NAME}.exe")
+
+
+def resolve_step_helper_command() -> List[str]:
+    """Resolve the external STEP helper invocation for source and frozen runs."""
+    if getattr(sys, "frozen", False):
+        helper_executable = _step_helper_executable_path()
+        if not helper_executable.is_file():
+            raise FileNotFoundError(
+                f"STEP-Helfer nicht gefunden: {helper_executable}. "
+                "Bitte das Release mit StepLayerGenerator.exe neu bauen."
+            )
+        return [str(helper_executable)]
+
+    uv_executable = shutil.which("uv")
+    if uv_executable is None:
+        raise FileNotFoundError(
+            "uv wurde nicht gefunden. Bitte uv installieren oder das gebaute Release mit StepLayerGenerator.exe verwenden."
+        )
+
+    helper_script = _step_helper_source_script_path()
+    if not helper_script.is_file():
+        raise FileNotFoundError(f"STEP-Helferskript nicht gefunden: {helper_script}")
+
+    return [
+        uv_executable,
+        "run",
+        "--python",
+        STEP_HELPER_SOURCE_PYTHON,
+        "--with",
+        STEP_HELPER_CADQUERY_SPEC,
+        "--",
+        "python",
+        str(helper_script),
+    ]
+
+
+def generate_step_layer_artifact(
+    step_file_path: Union[str, Path],
+    point_spacing_mm: float,
+    layer_height_mm: float,
+    support_layer_count: int = STEP_SUPPORT_LAYER_COUNT_DEFAULT,
+) -> StepGeneratedArtifact:
+    """Generate one temporary ZIP+manifest pair from a STEP file via the external helper."""
+    step_path = Path(step_file_path).resolve()
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", step_path.stem).strip("._-") or "step_model"
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"{safe_stem}_step_layers_"))
+    output_zip_path = temp_dir / f"{safe_stem}_layers.zip"
+    manifest_json_path = temp_dir / f"{safe_stem}_layers_manifest.json"
+    command = resolve_step_helper_command() + [
+        "--step-file",
+        str(step_path),
+        "--output-zip",
+        str(output_zip_path),
+        "--manifest-json",
+        str(manifest_json_path),
+        "--point-spacing-mm",
+        f"{float(point_spacing_mm):.9g}",
+        "--layer-height-mm",
+        f"{float(layer_height_mm):.9g}",
+        "--support-layer-count",
+        str(max(0, int(support_layer_count))),
+    ]
+    helper_env = os.environ.copy()
+    for env_key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
+        helper_env.pop(env_key, None)
+    completed = subprocess.run(
+        command,
+        cwd=str(Path(__file__).resolve().parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=helper_env,
+    )
+    if completed.returncode != 0:
+        stderr_text = (completed.stderr or "").strip()
+        stdout_text = (completed.stdout or "").strip()
+        detail = stderr_text or stdout_text or f"Helper-Exitcode {completed.returncode}"
+        raise RuntimeError(f"STEP-Helfer fehlgeschlagen fuer {step_path.name}: {detail}")
+
+    if not output_zip_path.is_file():
+        raise FileNotFoundError(f"STEP-Helfer hat kein ZIP erzeugt: {output_zip_path}")
+    if not manifest_json_path.is_file():
+        raise FileNotFoundError(f"STEP-Helfer hat kein Manifest erzeugt: {manifest_json_path}")
+
+    manifest_data = json.loads(manifest_json_path.read_text(encoding="utf-8"))
+    return StepGeneratedArtifact(
+        source_step_path=step_path,
+        generated_zip_path=output_zip_path,
+        manifest_json_path=manifest_json_path,
+        manifest_data=manifest_data,
+    )
+
+
 def _classify_b99_type(type_digit: int) -> str:
     """Classify the type digit from a B99 filename."""
     if type_digit == 9:
@@ -442,12 +600,13 @@ def parse_b99_archive_entry_name(entry_name: str) -> Optional[Tuple[int, str]]:
 
 def build_input_sources(
     selected_paths: Sequence[str],
-    zip_entry_type: str = "infill",
+    zip_entry_types: Optional[Sequence[str]] = None,
     zip_support_end_layer: int = 0,
 ) -> Tuple[List[InputSource], List[str]]:
     """Resolve selected files and ZIP archives into concrete processable input sources."""
     resolved_sources: List[InputSource] = []
     errors: List[str] = []
+    selected_entry_types = set(normalize_zip_entry_types(zip_entry_types))
 
     for selected_path in selected_paths:
         path_obj = Path(selected_path)
@@ -465,7 +624,7 @@ def build_input_sources(
                     layer_value, entry_type = parsed
                     if layer_value <= zip_support_end_layer:
                         continue
-                    if entry_type != zip_entry_type:
+                    if entry_type not in selected_entry_types:
                         continue
                     matching_entries.append((archive_member, layer_value, entry_type))
         except zipfile.BadZipFile as exc:
@@ -476,9 +635,12 @@ def build_input_sources(
             continue
 
         if not matching_entries:
+            selected_label = ", ".join(
+                ZIP_ENTRY_TYPE_LABELS.get(entry_type, entry_type) for entry_type in normalize_zip_entry_types(zip_entry_types)
+            )
             errors.append(
                 f"{selected_path}: Keine passenden .B99-Eintraege fuer Typ "
-                f"'{ZIP_ENTRY_TYPE_LABELS.get(zip_entry_type, zip_entry_type)}' oberhalb Schicht {zip_support_end_layer} gefunden."
+                f"'{selected_label}' oberhalb Schicht {zip_support_end_layer} gefunden."
             )
             continue
 
@@ -1656,12 +1818,13 @@ def ask_for_input_files(parent: tk.Misc) -> Tuple[str, ...]:
     parent.update_idletasks()
     return filedialog.askopenfilenames(
         parent=parent,
-        title="ABS-Dateien auswaehlen",
+        title="Dateien auswaehlen",
         filetypes=(
-            ("Unterstuetzte Dateien", "*.txt *.b99 *.zip"),
+            ("Unterstuetzte Dateien", "*.txt *.b99 *.zip *.step *.stp"),
             ("Textdateien", "*.txt"),
             ("B99-Dateien", "*.b99"),
             ("ZIP-Dateien", "*.zip"),
+            ("STEP-Dateien", "*.step *.stp"),
             ("Alle Dateien", "*.*"),
         ),
     )
@@ -1680,10 +1843,10 @@ def ask_for_zip_path(parent: tk.Misc, initial_name: str) -> str:
 
 def ask_for_zip_import_settings(
     parent: tk.Misc,
-    current_entry_type: str,
+    current_entry_types: Sequence[str],
     current_support_end_layer: int,
 ) -> Optional[Dict[str, object]]:
-    """Ask which B99 type should be imported from ZIP files and where support ends."""
+    """Ask which B99 types should be imported from ZIP files and where support ends."""
     dialog = tk.Toplevel(parent)
     dialog.title("ZIP-Import")
     dialog.transient(parent)
@@ -1692,12 +1855,16 @@ def ask_for_zip_import_settings(
     dialog.configure(bg="#1a1a1a")
 
     result = {"value": None}
-    entry_type_var = tk.StringVar(value=current_entry_type)
+    normalized_types = set(normalize_zip_entry_types(current_entry_types))
+    entry_type_vars = {
+        entry_type: tk.BooleanVar(value=entry_type in normalized_types)
+        for entry_type in ZIP_ENTRY_TYPES
+    }
     support_end_var = tk.StringVar(value=str(current_support_end_layer))
     help_var = tk.StringVar(
         value=(
             "ZIP-Dateien werden nach .B99-Dateien durchsucht. "
-            "Waehlen Sie die Art und bis zu welcher Schicht die Stuetstruktur ignoriert werden soll."
+            "Waehlen Sie die Arten und bis zu welcher Schicht die Stuetstruktur ignoriert werden soll."
         )
     )
 
@@ -1716,20 +1883,33 @@ def ask_for_zip_import_settings(
     form = tk.Frame(frame, bg="#1a1a1a")
     form.pack(fill="x", pady=(14, 10))
 
-    tk.Label(form, text="Art", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+    tk.Label(form, text="Arten", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
         row=0,
         column=0,
-        sticky="w",
+        sticky="nw",
         pady=4,
     )
-    entry_type_box = ttk.Combobox(
-        form,
-        textvariable=entry_type_var,
-        values=ZIP_ENTRY_TYPES,
-        state="readonly",
-        width=16,
-    )
-    entry_type_box.grid(row=0, column=1, sticky="w", pady=4)
+    type_frame = tk.Frame(form, bg="#1a1a1a")
+    type_frame.grid(row=0, column=1, sticky="w", pady=4)
+    type_buttons: List[tk.Checkbutton] = []
+    for entry_type in ZIP_ENTRY_TYPES:
+        button = tk.Checkbutton(
+            type_frame,
+            text=ZIP_ENTRY_TYPE_LABELS.get(entry_type, entry_type),
+            variable=entry_type_vars[entry_type],
+            onvalue=True,
+            offvalue=False,
+            bg="#1a1a1a",
+            fg="#f0f0f0",
+            activebackground="#1a1a1a",
+            activeforeground="#f0f0f0",
+            selectcolor="#2a2a2a",
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+        )
+        button.pack(anchor="w")
+        type_buttons.append(button)
 
     tk.Label(form, text="Stuetzstruktur bis Schicht", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
         row=1,
@@ -1761,9 +1941,11 @@ def ask_for_zip_import_settings(
     button_row.pack(fill="x")
 
     def confirm() -> None:
-        selected_type = entry_type_var.get()
-        if selected_type not in ZIP_ENTRY_TYPES:
-            messagebox.showerror("ZIP-Import", "Bitte eine gueltige Art auswaehlen.", parent=dialog)
+        selected_types = tuple(
+            entry_type for entry_type in ZIP_ENTRY_TYPES if bool(entry_type_vars[entry_type].get())
+        )
+        if not selected_types:
+            messagebox.showerror("ZIP-Import", "Bitte mindestens eine gueltige Art auswaehlen.", parent=dialog)
             return
 
         try:
@@ -1777,7 +1959,7 @@ def ask_for_zip_import_settings(
             return
 
         result["value"] = {
-            "entry_type": selected_type,
+            "entry_types": selected_types,
             "support_end_layer": support_end_layer,
         }
         dialog.destroy()
@@ -1786,7 +1968,138 @@ def ask_for_zip_import_settings(
     ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(side="left", padx=(10, 0))
 
     center_toplevel(parent, dialog)
-    entry_type_box.focus_set()
+    if type_buttons:
+        type_buttons[0].focus_set()
+    dialog.wait_window()
+    return result["value"]
+
+
+def ask_for_step_import_settings(
+    parent: tk.Misc,
+    current_point_spacing_mm: float,
+    current_layer_height_mm: float,
+    current_support_layer_count: int,
+) -> Optional[Dict[str, Union[float, int]]]:
+    """Ask for the geometric STEP import settings."""
+    dialog = tk.Toplevel(parent)
+    dialog.title("STEP-Import")
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+    dialog.configure(bg="#1a1a1a")
+
+    result = {"value": None}
+    point_spacing_var = tk.StringVar(value=f"{float(current_point_spacing_mm):.6g}")
+    layer_height_var = tk.StringVar(value=f"{float(current_layer_height_mm):.6g}")
+    support_layer_var = tk.StringVar(value=str(max(0, int(current_support_layer_count))))
+
+    frame = tk.Frame(dialog, bg="#1a1a1a", padx=18, pady=16)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text="STEP-Import zu B99-Layern",
+        bg="#1a1a1a",
+        fg="#f0f0f0",
+        font=("Segoe UI", 10, "bold"),
+        justify="left",
+    ).pack(anchor="w")
+
+    form = tk.Frame(frame, bg="#1a1a1a")
+    form.pack(fill="x", pady=(14, 10))
+
+    tk.Label(form, text="Punktabstand (mm)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=0,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    point_spacing_entry = tk.Entry(form, textvariable=point_spacing_var, width=14, font=("Segoe UI", 10))
+    point_spacing_entry.grid(row=0, column=1, sticky="w", pady=4)
+
+    tk.Label(form, text="Ebenendicke (mm)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=1,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    layer_height_entry = tk.Entry(form, textvariable=layer_height_var, width=14, font=("Segoe UI", 10))
+    layer_height_entry.grid(row=1, column=1, sticky="w", pady=4)
+
+    tk.Label(form, text="Stuetzschichten", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
+        row=2,
+        column=0,
+        sticky="w",
+        pady=4,
+    )
+    support_layer_spin = tk.Spinbox(
+        form,
+        from_=0,
+        to=9999,
+        textvariable=support_layer_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+    support_layer_spin.grid(row=2, column=1, sticky="w", pady=4)
+
+    tk.Label(
+        frame,
+        text=(
+            "STEP-Einheiten werden als Millimeter interpretiert. "
+            "Die Schichten werden entlang der globalen Z-Achse gesliced, "
+            "und die XY-Koordinaten bleiben unveraendert. "
+            "Stuetzschichten nutzen die Outline der ersten Bauteilschicht."
+        ),
+        bg="#1a1a1a",
+        fg="#d0d0d0",
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=460,
+    ).pack(anchor="w", pady=(0, 14))
+
+    button_row = tk.Frame(frame, bg="#1a1a1a")
+    button_row.pack(fill="x")
+
+    def confirm() -> None:
+        try:
+            point_spacing_mm = float(point_spacing_var.get())
+            layer_height_mm = float(layer_height_var.get())
+            support_layer_count = int(support_layer_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "STEP-Import",
+                "Bitte gueltige Werte fuer Punktabstand, Ebenendicke und Stuetzschichten eingeben.",
+                parent=dialog,
+            )
+            return
+
+        if point_spacing_mm <= 0.0 or layer_height_mm <= 0.0:
+            messagebox.showerror(
+                "STEP-Import",
+                "Punktabstand und Ebenendicke muessen groesser als 0 sein.",
+                parent=dialog,
+            )
+            return
+        if support_layer_count < 0:
+            messagebox.showerror(
+                "STEP-Import",
+                "Die Anzahl der Stuetzschichten muss groesser oder gleich 0 sein.",
+                parent=dialog,
+            )
+            return
+
+        result["value"] = {
+            "point_spacing_mm": float(point_spacing_mm),
+            "layer_height_mm": float(layer_height_mm),
+            "support_layer_count": int(support_layer_count),
+        }
+        dialog.destroy()
+
+    ttk.Button(button_row, text="Weiter", command=confirm).pack(side="left")
+    ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(side="left", padx=(10, 0))
+
+    center_toplevel(parent, dialog)
+    point_spacing_entry.focus_set()
     dialog.wait_window()
     return result["value"]
 
@@ -2491,16 +2804,119 @@ def center_toplevel(parent: tk.Misc, window: tk.Toplevel) -> None:
     window.geometry(f"+{max(x_pos, 0)}+{max(y_pos, 0)}")
 
 
-def run_interactive_viewer(payload_path: str) -> int:
-    """Run the standalone Qt/PyQtGraph viewer for one payload file."""
+def run_modal_background_task(
+    parent: tk.Misc,
+    title: str,
+    message: str,
+    task: Callable[[], Any],
+) -> Any:
+    """Run one blocking task in a worker thread while keeping the Tk UI responsive."""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+    dialog.configure(bg="#1a1a1a")
+    dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    frame = tk.Frame(dialog, bg="#1a1a1a", padx=18, pady=16)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text=title,
+        bg="#1a1a1a",
+        fg="#f0f0f0",
+        font=("Segoe UI", 10, "bold"),
+        justify="left",
+    ).pack(anchor="w")
+
+    tk.Label(
+        frame,
+        text=message,
+        bg="#1a1a1a",
+        fg="#d0d0d0",
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=460,
+    ).pack(anchor="w", pady=(10, 8))
+
+    elapsed_var = tk.StringVar(value="Bitte warten...")
+    ttk.Progressbar(frame, mode="indeterminate", length=320).pack(fill="x", pady=(0, 8))
+    progress = frame.winfo_children()[-1]
+    assert isinstance(progress, ttk.Progressbar)
+    progress.start(12)
+
+    tk.Label(
+        frame,
+        textvariable=elapsed_var,
+        bg="#1a1a1a",
+        fg="#b8b8b8",
+        font=("Segoe UI", 9),
+        justify="left",
+    ).pack(anchor="w")
+
+    result: Dict[str, Any] = {"value": None, "error": None}
+    started_at = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(task)
+    cursor_supported = True
+    previous_cursor = ""
+    try:
+        previous_cursor = str(parent.cget("cursor"))
+        parent.configure(cursor="watch")
+    except Exception:
+        cursor_supported = False
+
+    def finish() -> None:
+        try:
+            progress.stop()
+        except Exception:
+            pass
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        if dialog.winfo_exists():
+            dialog.destroy()
+
+    def poll() -> None:
+        if future.done():
+            try:
+                result["value"] = future.result()
+            except BaseException as exc:
+                result["error"] = exc
+            finish()
+            return
+
+        elapsed_seconds = time.perf_counter() - started_at
+        elapsed_var.set(f"Bitte warten... {format_duration(elapsed_seconds, include_tenths=True)}")
+        dialog.after(80, poll)
+
+    center_toplevel(parent, dialog)
+    dialog.after(60, poll)
+    dialog.wait_window()
+    executor.shutdown(wait=False)
+    if cursor_supported:
+        try:
+            parent.configure(cursor=previous_cursor)
+        except Exception:
+            pass
+
+    if result["error"] is not None:
+        raise result["error"]
+    return result["value"]
+
+
+def run_interactive_viewer(payload_path: str, preferred_backend: str = "raster") -> int:
+    """Run the standalone exact Qt viewer for one payload file."""
     try:
         import numpy as np
-        import pyqtgraph as pg
-        from PySide6 import QtCore, QtGui, QtWidgets
+        from PySide6 import QtCore, QtGui, QtOpenGL, QtOpenGLWidgets, QtWidgets
     except Exception as exc:
         show_fatal_error(
             "Der interaktive Viewer konnte nicht gestartet werden.\n\n"
-            "Bitte installieren Sie PySide6, pyqtgraph und numpy.\n\n"
+            "Bitte installieren Sie PySide6 und numpy.\n\n"
             f"Technischer Hinweis:\n{exc}"
         )
         return 1
@@ -2514,27 +2930,997 @@ def run_interactive_viewer(payload_path: str) -> int:
         except OSError:
             pass
 
-    def configure_viewer_graphics(use_opengl: bool) -> None:
-        pg.setConfigOptions(
-            antialias=False,
-            leftButtonPan=True,
-            background="#0a0a0a",
-            foreground="#f0f0f0",
-            useOpenGL=use_opengl,
+    GL_BLEND = 0x0BE2
+    GL_COLOR_BUFFER_BIT = 0x00004000
+    GL_FLOAT = 0x1406
+    GL_ONE_MINUS_SRC_ALPHA = 0x0303
+    GL_POINTS = 0x0000
+    GL_PROGRAM_POINT_SIZE = 0x8642
+    GL_POINT_SPRITE = 0x8861
+    GL_SRC_ALPHA = 0x0302
+    VIEWER_GL_MAX_BATCH_POINTS = 1_000_000
+    VIEWER_RASTER_IDLE_REDRAW_MS = 200
+    VIEWER_DEFAULT_BACKGROUND_COLOR = "#0a0a0a"
+
+    def hex_to_qcolor(color_value: str, alpha: float = 1.0) -> QtGui.QColor:
+        color = QtGui.QColor(color_value)
+        color.setAlphaF(max(0.0, min(1.0, float(alpha))))
+        return color
+
+    def hex_to_rgba(color_value: str, alpha: float = 1.0) -> Tuple[float, float, float, float]:
+        color = hex_to_qcolor(color_value, alpha)
+        return (color.redF(), color.greenF(), color.blueF(), color.alphaF())
+
+    def build_trail_rgba(count: int) -> List[Tuple[float, float, float, float]]:
+        return [hex_to_rgba(color) for color in build_trail_colors(count)]
+
+    def map_points_to_screen(
+        points: Any,
+        center_x_mm: float,
+        center_y_mm: float,
+        pixels_per_mm: float,
+        width_px: int,
+        height_px: int,
+    ) -> Any:
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        mapped = np.empty((len(points), 2), dtype=np.float32)
+        mapped[:, 0] = (points[:, 0] - center_x_mm) * pixels_per_mm + (width_px * 0.5)
+        mapped[:, 1] = (height_px * 0.5) - (points[:, 1] - center_y_mm) * pixels_per_mm
+        return mapped
+
+    def mapped_points_to_polygon(mapped_points: Any) -> QtGui.QPolygonF:
+        polygon = QtGui.QPolygonF()
+        for x_pos, y_pos in mapped_points:
+            polygon.append(QtCore.QPointF(float(x_pos), float(y_pos)))
+        return polygon
+
+    def draw_mapped_points(
+        painter: QtGui.QPainter,
+        mapped_points: Any,
+        color: QtGui.QColor,
+        diameter_px: float,
+    ) -> None:
+        if len(mapped_points) == 0:
+            return
+        pen = QtGui.QPen(color)
+        pen.setWidthF(max(1.0, float(diameter_px)))
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPoints(mapped_points_to_polygon(mapped_points))
+
+    def build_frame_state(
+        points: Any,
+        progress: float,
+        trail_length: int,
+        gradient_window: int,
+        policy_name: str,
+    ) -> Dict[str, Any]:
+        point_count = len(points)
+        if point_count <= 0:
+            return {
+                "base_index": -1,
+                "head_point": None,
+                "gray_range": None,
+                "gradient_ranges": [],
+                "gradient_color_count": 0,
+                "stats": VIEWER_EMPTY_RENDER_STATS,
+            }
+
+        safe_progress = max(0.0, min(float(progress), point_count - 1))
+        base_index = min(max(int(safe_progress), 0), point_count - 1)
+        safe_trail_length = max(1, min(int(trail_length), point_count))
+        safe_gradient_window = max(1, min(int(gradient_window), point_count))
+        next_index = min(base_index + 1, point_count - 1)
+        segment_fraction = max(0.0, min(1.0, safe_progress - base_index))
+        start_point = points[base_index]
+        end_point = points[next_index]
+        head_point = (
+            float(start_point[0] + (end_point[0] - start_point[0]) * segment_fraction),
+            float(start_point[1] + (end_point[1] - start_point[1]) * segment_fraction),
         )
+        gray_range, gradient_range = compute_viewer_trail_ranges(
+            point_count=point_count,
+            base_index=base_index,
+            trail_length=safe_trail_length,
+            gradient_window=safe_gradient_window,
+        )
+        gradient_ranges: List[Tuple[int, int]] = []
+        gradient_color_count = 0
+        if gradient_range is not None:
+            gradient_count = gradient_range[1] - gradient_range[0] + 1
+            gradient_color_count = min(MAX_RENDER_GRADIENT_BINS, gradient_count)
+            gradient_ranges = build_gradient_bin_ranges(
+                gradient_range[0],
+                gradient_range[1],
+                gradient_color_count,
+            )
+        gray_count = 0 if gray_range is None else gray_range[1] - gray_range[0] + 1
+        gradient_count = 0 if gradient_range is None else gradient_range[1] - gradient_range[0] + 1
+        stats = ViewerRenderStats(
+            requested_trail_count=gray_count + gradient_count,
+            requested_gradient_count=gradient_count,
+            displayed_trail_count=gray_count + gradient_count,
+            displayed_gradient_count=gradient_count,
+            policy_name=policy_name,
+        )
+        return {
+            "base_index": base_index,
+            "head_point": head_point,
+            "gray_range": gray_range,
+            "gradient_ranges": gradient_ranges,
+            "gradient_color_count": gradient_color_count,
+            "stats": stats,
+        }
+
+    def make_surface_format() -> QtGui.QSurfaceFormat:
+        fmt = QtGui.QSurfaceFormat()
+        fmt.setRenderableType(QtGui.QSurfaceFormat.RenderableType.OpenGL)
+        fmt.setProfile(QtGui.QSurfaceFormat.OpenGLContextProfile.NoProfile)
+        fmt.setVersion(2, 1)
+        fmt.setSwapBehavior(QtGui.QSurfaceFormat.SwapBehavior.DoubleBuffer)
+        fmt.setDepthBufferSize(0)
+        fmt.setStencilBufferSize(0)
+        return fmt
+
+    def probe_opengl() -> None:
+        offscreen_surface = QtGui.QOffscreenSurface()
+        offscreen_surface.setFormat(make_surface_format())
+        offscreen_surface.create()
+        if not offscreen_surface.isValid():
+            raise RuntimeError("Qt konnte keine gueltige Offscreen-OpenGL-Oberflaeche erzeugen.")
+        context = QtGui.QOpenGLContext()
+        context.setFormat(make_surface_format())
+        if not context.create():
+            raise RuntimeError("Qt konnte keinen OpenGL-Kontext erzeugen.")
+        if not context.makeCurrent(offscreen_surface):
+            raise RuntimeError("Der erzeugte OpenGL-Kontext konnte nicht aktiviert werden.")
+        context.doneCurrent()
+
+    def render_raster_background_image(points: Any, snapshot: Dict[str, Any]) -> QtGui.QImage:
+        width_px = max(1, int(snapshot["width_px"]))
+        height_px = max(1, int(snapshot["height_px"]))
+        image = QtGui.QImage(width_px, height_px, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(hex_to_qcolor(VIEWER_DEFAULT_BACKGROUND_COLOR))
+        if len(points) <= 0:
+            return image
+
+        mapped_points = map_points_to_screen(
+            points,
+            snapshot["center_x_mm"],
+            snapshot["center_y_mm"],
+            snapshot["pixels_per_mm"],
+            width_px,
+            height_px,
+        )
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        draw_mapped_points(
+            painter,
+            mapped_points,
+            hex_to_qcolor(VIEWER_BACKGROUND_COLOR),
+            snapshot["point_size_px"],
+        )
+        painter.end()
+        return image
+
+    class SharedTransformState(QtCore.QObject):
+        changed = QtCore.Signal(str)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.center_x_mm = 0.0
+            self.center_y_mm = 0.0
+            self.pixels_per_mm = 6.0
+
+        def set_transform(
+            self,
+            center_x_mm: float,
+            center_y_mm: float,
+            pixels_per_mm: float,
+            reason: str = "programmatic",
+        ) -> None:
+            new_scale = max(1e-6, float(pixels_per_mm))
+            changed = (
+                not math.isclose(self.center_x_mm, float(center_x_mm), rel_tol=0.0, abs_tol=1e-12)
+                or not math.isclose(self.center_y_mm, float(center_y_mm), rel_tol=0.0, abs_tol=1e-12)
+                or not math.isclose(self.pixels_per_mm, new_scale, rel_tol=0.0, abs_tol=1e-12)
+            )
+            self.center_x_mm = float(center_x_mm)
+            self.center_y_mm = float(center_y_mm)
+            self.pixels_per_mm = new_scale
+            if changed:
+                self.changed.emit(reason)
+
+        def shift_world(self, dx_mm: float, dy_mm: float, reason: str = "pan") -> None:
+            self.set_transform(
+                self.center_x_mm + float(dx_mm),
+                self.center_y_mm + float(dy_mm),
+                self.pixels_per_mm,
+                reason,
+            )
+
+        def pan_pixels(self, dx_px: float, dy_px: float, reason: str = "pan") -> None:
+            scale = max(1e-6, self.pixels_per_mm)
+            self.set_transform(
+                self.center_x_mm - (float(dx_px) / scale),
+                self.center_y_mm + (float(dy_px) / scale),
+                scale,
+                reason,
+            )
+
+        def zoom_about(self, anchor_world: Tuple[float, float], factor: float, reason: str = "zoom") -> None:
+            safe_factor = max(0.05, min(40.0, float(factor)))
+            old_scale = max(1e-6, self.pixels_per_mm)
+            new_scale = max(1e-6, min(old_scale * safe_factor, 1_000_000.0))
+            anchor_x, anchor_y = anchor_world
+            scale_ratio = old_scale / new_scale
+            self.set_transform(
+                anchor_x - ((anchor_x - self.center_x_mm) * scale_ratio),
+                anchor_y - ((anchor_y - self.center_y_mm) * scale_ratio),
+                new_scale,
+                reason,
+            )
+
+        def fit_bounds(self, bounds: Tuple[float, float, float, float], viewport_size: QtCore.QSize, reason: str = "home") -> None:
+            min_x, max_x, min_y, max_y = bounds
+            width_px = max(1, int(viewport_size.width()))
+            height_px = max(1, int(viewport_size.height()))
+            span_x = max(float(max_x - min_x), 1e-6)
+            span_y = max(float(max_y - min_y), 1e-6)
+            padding_factor = 0.92
+            pixels_per_mm = min(
+                (width_px * padding_factor) / span_x,
+                (height_px * padding_factor) / span_y,
+            )
+            if not math.isfinite(pixels_per_mm) or pixels_per_mm <= 0.0:
+                pixels_per_mm = 1.0
+            self.set_transform(
+                (float(min_x) + float(max_x)) * 0.5,
+                (float(min_y) + float(max_y)) * 0.5,
+                pixels_per_mm,
+                reason,
+            )
+
+    class SequenceViewMixin:
+        def _init_sequence_view(
+            self,
+            transform_state: SharedTransformState,
+            coordinate_unit: str,
+            build_plate_width_mm: float,
+            build_plate_depth_mm: float,
+            origin_reference: str,
+            backend_name: str,
+            navigation_callback: Callable[[], None],
+        ) -> None:
+            self.transform_state = transform_state
+            self.coordinate_unit = coordinate_unit
+            self.build_plate_width_mm = float(build_plate_width_mm)
+            self.build_plate_depth_mm = float(build_plate_depth_mm)
+            self.origin_reference = origin_reference
+            self.backend_name = backend_name
+            self.navigation_callback = navigation_callback
+            self.points = np.empty((0, 2), dtype=np.float32)
+            self.point_size_mm = VIEWER_POINT_SIZE_MM_DEFAULT
+            self.base_index = -1
+            self.head_point: Optional[Tuple[float, float]] = None
+            self.gray_range: Optional[Tuple[int, int]] = None
+            self.gradient_ranges: List[Tuple[int, int]] = []
+            self.gradient_rgba_cache: Dict[int, List[Tuple[float, float, float, float]]] = {}
+            self.gradient_qcolor_cache: Dict[int, List[QtGui.QColor]] = {}
+            self.current_stats = VIEWER_EMPTY_RENDER_STATS
+            self._drag_active = False
+            self._last_drag_pos: Optional[QtCore.QPointF] = None
+            self.setMouseTracking(True)
+            self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+            self.transform_state.changed.connect(self._on_transform_changed)
+
+        def _on_transform_changed(self, _reason: str) -> None:
+            self.update()
+
+        def _set_points_common(self, points: Any) -> None:
+            if len(points) <= 0:
+                self.points = np.empty((0, 2), dtype=np.float32)
+            else:
+                self.points = np.ascontiguousarray(points, dtype=np.float32)
+            self.base_index = -1
+            self.head_point = None
+            self.gray_range = None
+            self.gradient_ranges = []
+            self.current_stats = VIEWER_EMPTY_RENDER_STATS
+
+        def _set_progress_common(
+            self,
+            progress: float,
+            trail_length: int,
+            gradient_window: int,
+            render_policy: ViewerRenderPolicy,
+        ) -> ViewerRenderStats:
+            state = build_frame_state(
+                self.points,
+                progress,
+                trail_length,
+                gradient_window,
+                render_policy.name,
+            )
+            self.base_index = state["base_index"]
+            self.head_point = state["head_point"]
+            self.gray_range = state["gray_range"]
+            self.gradient_ranges = state["gradient_ranges"]
+            self.current_stats = state["stats"]
+            return self.current_stats
+
+        def current_point_text(self) -> str:
+            point_count = len(self.points)
+            if point_count <= 0:
+                return "Point 0 / 0"
+            if self.base_index < 0:
+                return f"Point 1 / {point_count}"
+            return f"Point {self.base_index + 1} / {point_count}"
+
+        def _point_diameter_px(self, multiplier: float = 1.0) -> float:
+            return max(1.0, self.transform_state.pixels_per_mm * self.point_size_mm * float(multiplier))
+
+        def world_to_screen(self, x_mm: float, y_mm: float) -> QtCore.QPointF:
+            return QtCore.QPointF(
+                ((float(x_mm) - self.transform_state.center_x_mm) * self.transform_state.pixels_per_mm) + (self.width() * 0.5),
+                (self.height() * 0.5) - ((float(y_mm) - self.transform_state.center_y_mm) * self.transform_state.pixels_per_mm),
+            )
+
+        def screen_to_world(self, point: QtCore.QPointF) -> Tuple[float, float]:
+            scale = max(1e-6, self.transform_state.pixels_per_mm)
+            return (
+                self.transform_state.center_x_mm + ((float(point.x()) - (self.width() * 0.5)) / scale),
+                self.transform_state.center_y_mm - ((float(point.y()) - (self.height() * 0.5)) / scale),
+            )
+
+        def visible_world_bounds(self) -> Tuple[float, float, float, float]:
+            scale = max(1e-6, self.transform_state.pixels_per_mm)
+            half_width_mm = self.width() * 0.5 / scale
+            half_height_mm = self.height() * 0.5 / scale
+            return (
+                self.transform_state.center_x_mm - half_width_mm,
+                self.transform_state.center_x_mm + half_width_mm,
+                self.transform_state.center_y_mm - half_height_mm,
+                self.transform_state.center_y_mm + half_height_mm,
+            )
+
+        def pan_by_fraction(self, x_fraction: float, y_fraction: float) -> None:
+            min_x, max_x, min_y, max_y = self.visible_world_bounds()
+            self.transform_state.shift_world(
+                (max_x - min_x) * float(x_fraction),
+                (max_y - min_y) * float(y_fraction),
+                "pan",
+            )
+
+        def _trail_qcolors(self, count: int) -> List[QtGui.QColor]:
+            cached = self.gradient_qcolor_cache.get(count)
+            if cached is None:
+                cached = [hex_to_qcolor(color) for color in build_trail_colors(count)]
+                self.gradient_qcolor_cache[count] = cached
+            return cached
+
+        def _trail_rgba(self, count: int) -> List[Tuple[float, float, float, float]]:
+            cached = self.gradient_rgba_cache.get(count)
+            if cached is None:
+                cached = build_trail_rgba(count)
+                self.gradient_rgba_cache[count] = cached
+            return cached
+
+        def _nice_grid_step_mm(self) -> float:
+            target_pixels = 80.0
+            target_mm = target_pixels / max(1e-6, self.transform_state.pixels_per_mm)
+            exponent = math.floor(math.log10(max(target_mm, 1e-6)))
+            base = 10.0 ** exponent
+            for multiplier in (1.0, 2.0, 5.0, 10.0):
+                candidate = base * multiplier
+                if candidate >= target_mm:
+                    return candidate
+            return base * 10.0
+
+        def _plate_bounds(self) -> Tuple[float, float, float, float]:
+            if self.origin_reference == "build_plate_centre":
+                return (
+                    -(self.build_plate_width_mm * 0.5),
+                    self.build_plate_width_mm * 0.5,
+                    -(self.build_plate_depth_mm * 0.5),
+                    self.build_plate_depth_mm * 0.5,
+                )
+            return (0.0, self.build_plate_width_mm, 0.0, self.build_plate_depth_mm)
+
+        def _paint_overlay(self, painter: QtGui.QPainter) -> None:
+            painter.save()
+            painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
+            grid_pen = QtGui.QPen(hex_to_qcolor("#ffffff", 0.08))
+            grid_pen.setWidthF(1.0)
+            painter.setPen(grid_pen)
+            min_x, max_x, min_y, max_y = self.visible_world_bounds()
+            grid_step = self._nice_grid_step_mm()
+
+            x_value = math.floor(min_x / grid_step) * grid_step
+            while x_value <= max_x + 1e-9:
+                screen_point = self.world_to_screen(x_value, 0.0)
+                painter.drawLine(
+                    QtCore.QPointF(screen_point.x(), 0.0),
+                    QtCore.QPointF(screen_point.x(), float(self.height())),
+                )
+                x_value += grid_step
+
+            y_value = math.floor(min_y / grid_step) * grid_step
+            while y_value <= max_y + 1e-9:
+                screen_point = self.world_to_screen(0.0, y_value)
+                painter.drawLine(
+                    QtCore.QPointF(0.0, screen_point.y()),
+                    QtCore.QPointF(float(self.width()), screen_point.y()),
+                )
+                y_value += grid_step
+
+            plate_pen = QtGui.QPen(hex_to_qcolor("#f0f0f0", 0.30))
+            plate_pen.setWidthF(1.25)
+            painter.setPen(plate_pen)
+            plate_min_x, plate_max_x, plate_min_y, plate_max_y = self._plate_bounds()
+            top_left = self.world_to_screen(plate_min_x, plate_max_y)
+            bottom_right = self.world_to_screen(plate_max_x, plate_min_y)
+            painter.drawRect(QtCore.QRectF(top_left, bottom_right).normalized())
+
+            label_pen = QtGui.QPen(hex_to_qcolor("#f0f0f0", 0.70))
+            painter.setPen(label_pen)
+            label_font = painter.font()
+            label_font.setPointSize(max(8, label_font.pointSize()))
+            painter.setFont(label_font)
+
+            x_label = f"X ({self.coordinate_unit})"
+            y_label = f"Y ({self.coordinate_unit})"
+            painter.drawText(QtCore.QRectF(12.0, float(self.height()) - 28.0, 160.0, 20.0), x_label)
+            painter.save()
+            painter.translate(24.0, 24.0)
+            painter.rotate(-90.0)
+            painter.drawText(QtCore.QRectF(-120.0, -16.0, 120.0, 20.0), y_label)
+            painter.restore()
+
+            badge_rect = QtCore.QRectF(12.0, 12.0, 132.0, 24.0)
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(hex_to_qcolor("#101010", 0.72))
+            painter.drawRoundedRect(badge_rect, 6.0, 6.0)
+            painter.setPen(QtGui.QPen(hex_to_qcolor("#f0f0f0", 0.92)))
+            painter.drawText(badge_rect.adjusted(8.0, 0.0, -8.0, 0.0), QtCore.Qt.AlignmentFlag.AlignVCenter, self.backend_name)
+
+            if self.head_point is not None:
+                head_screen = self.world_to_screen(self.head_point[0], self.head_point[1])
+                head_radius = self._point_diameter_px(VIEWER_HEAD_SIZE_MULTIPLIER) * 0.5
+                painter.setBrush(hex_to_qcolor(VIEWER_HEAD_COLOR))
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                painter.drawEllipse(head_screen, head_radius, head_radius)
+
+            painter.restore()
+
+        def mousePressEvent(self, event: Any) -> None:
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                self.navigation_callback()
+                self._drag_active = True
+                self._last_drag_pos = event.position()
+                self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event: Any) -> None:
+            if self._drag_active and self._last_drag_pos is not None:
+                self.navigation_callback()
+                current_pos = event.position()
+                delta = current_pos - self._last_drag_pos
+                self.transform_state.pan_pixels(delta.x(), delta.y(), "pan")
+                self._last_drag_pos = current_pos
+                event.accept()
+                return
+            super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event: Any) -> None:
+            if event.button() == QtCore.Qt.MouseButton.LeftButton and self._drag_active:
+                self._drag_active = False
+                self._last_drag_pos = None
+                self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+                event.accept()
+                return
+            super().mouseReleaseEvent(event)
+
+        def wheelEvent(self, event: Any) -> None:
+            self.navigation_callback()
+            anchor_world = self.screen_to_world(event.position())
+            delta_steps = event.angleDelta().y() / 120.0
+            if delta_steps != 0.0:
+                self.transform_state.zoom_about(anchor_world, 1.15 ** delta_steps, "zoom")
+            event.accept()
+
+    class SequenceGLView(SequenceViewMixin, QtOpenGLWidgets.QOpenGLWidget):
+        def __init__(
+            self,
+            transform_state: SharedTransformState,
+            coordinate_unit: str,
+            build_plate_width_mm: float,
+            build_plate_depth_mm: float,
+            origin_reference: str,
+            navigation_callback: Callable[[], None],
+        ) -> None:
+            super().__init__()
+            self._init_sequence_view(
+                transform_state,
+                coordinate_unit,
+                build_plate_width_mm,
+                build_plate_depth_mm,
+                origin_reference,
+                "OpenGL",
+                navigation_callback,
+            )
+            self._gl_program: Optional[QtOpenGL.QOpenGLShaderProgram] = None
+            self._gl_functions: Any = None
+            self._gl_batches: List[Dict[str, Any]] = []
+            self._gl_ready = False
+            self._position_attribute = -1
+            self._center_uniform = -1
+            self._viewport_uniform = -1
+            self._scale_uniform = -1
+            self._color_uniform = -1
+            self._point_size_uniform = -1
+            self.setMinimumSize(320, 320)
+
+        def set_points(self, points: Any) -> None:
+            self._set_points_common(points)
+            if self._gl_ready:
+                self.makeCurrent()
+                try:
+                    self._upload_batches()
+                finally:
+                    self.doneCurrent()
+            self.update()
+
+        def set_marker_size_mm(self, point_size_mm: float) -> None:
+            self.point_size_mm = clamp_viewer_point_size_mm(point_size_mm)
+            self.update()
+
+        def update_progress(
+            self,
+            progress: float,
+            trail_length: int,
+            gradient_window: int,
+            render_policy: ViewerRenderPolicy,
+        ) -> ViewerRenderStats:
+            stats = self._set_progress_common(progress, trail_length, gradient_window, render_policy)
+            self.update()
+            return stats
+
+        def _build_program(self) -> QtOpenGL.QOpenGLShaderProgram:
+            program = QtOpenGL.QOpenGLShaderProgram(self.context())
+            vertex_source = """
+                attribute vec2 a_position_mm;
+                uniform vec2 u_center_mm;
+                uniform vec2 u_viewport_px;
+                uniform float u_pixels_per_mm;
+                uniform float u_point_size_px;
+                void main() {
+                    vec2 relative_mm = a_position_mm - u_center_mm;
+                    vec2 clip = vec2(
+                        (relative_mm.x * 2.0 * u_pixels_per_mm) / max(u_viewport_px.x, 1.0),
+                        (relative_mm.y * 2.0 * u_pixels_per_mm) / max(u_viewport_px.y, 1.0)
+                    );
+                    gl_Position = vec4(clip, 0.0, 1.0);
+                    gl_PointSize = u_point_size_px;
+                }
+            """
+            fragment_source = """
+                uniform vec4 u_color_rgba;
+                void main() {
+                    bool hasPointCoord = (
+                        gl_PointCoord.x >= 0.0 && gl_PointCoord.x <= 1.0 &&
+                        gl_PointCoord.y >= 0.0 && gl_PointCoord.y <= 1.0
+                    );
+                    if (hasPointCoord) {
+                        vec2 delta = gl_PointCoord - vec2(0.5, 0.5);
+                        if (dot(delta, delta) > 0.25) {
+                            discard;
+                        }
+                    }
+                    gl_FragColor = u_color_rgba;
+                }
+            """
+            if not program.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.ShaderTypeBit.Vertex, vertex_source):
+                raise RuntimeError(program.log() or "Vertex-Shader konnte nicht kompiliert werden.")
+            if not program.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.ShaderTypeBit.Fragment, fragment_source):
+                raise RuntimeError(program.log() or "Fragment-Shader konnte nicht kompiliert werden.")
+            if not program.link():
+                raise RuntimeError(program.log() or "OpenGL-Shader konnten nicht gelinkt werden.")
+            return program
+
+        def _destroy_batches(self) -> None:
+            for batch in self._gl_batches:
+                try:
+                    batch["buffer"].destroy()
+                except Exception:
+                    pass
+            self._gl_batches = []
+
+        def _upload_batches(self) -> None:
+            self._destroy_batches()
+            if len(self.points) <= 0 or self._gl_program is None:
+                return
+            for batch_start in range(0, len(self.points), VIEWER_GL_MAX_BATCH_POINTS):
+                batch_points = self.points[batch_start : batch_start + VIEWER_GL_MAX_BATCH_POINTS]
+                buffer = QtOpenGL.QOpenGLBuffer(QtOpenGL.QOpenGLBuffer.Type.VertexBuffer)
+                if not buffer.create():
+                    raise RuntimeError("OpenGL-VBO konnte nicht erzeugt werden.")
+                if not buffer.bind():
+                    raise RuntimeError("OpenGL-VBO konnte nicht gebunden werden.")
+                try:
+                    contiguous_points = np.ascontiguousarray(batch_points, dtype=np.float32)
+                    buffer.allocate(contiguous_points.tobytes(), int(contiguous_points.nbytes))
+                finally:
+                    buffer.release()
+                self._gl_batches.append(
+                    {
+                        "buffer": buffer,
+                        "global_start": batch_start,
+                        "count": len(batch_points),
+                    }
+                )
+
+        def initializeGL(self) -> None:
+            self._gl_functions = self.context().extraFunctions()
+            self._gl_program = self._build_program()
+            self._position_attribute = self._gl_program.attributeLocation("a_position_mm")
+            self._center_uniform = self._gl_program.uniformLocation("u_center_mm")
+            self._viewport_uniform = self._gl_program.uniformLocation("u_viewport_px")
+            self._scale_uniform = self._gl_program.uniformLocation("u_pixels_per_mm")
+            self._color_uniform = self._gl_program.uniformLocation("u_color_rgba")
+            self._point_size_uniform = self._gl_program.uniformLocation("u_point_size_px")
+            self._gl_functions.glEnable(GL_BLEND)
+            self._gl_functions.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            self._gl_functions.glEnable(GL_PROGRAM_POINT_SIZE)
+            try:
+                self._gl_functions.glEnable(GL_POINT_SPRITE)
+            except Exception:
+                # Modern drivers may not expose GL_POINT_SPRITE separately, but older
+                # compatibility contexts need it so gl_PointCoord becomes valid.
+                pass
+            self._gl_ready = True
+            self._upload_batches()
+
+        def _set_common_uniforms(self) -> None:
+            if self._gl_program is None:
+                return
+            self._gl_program.setUniformValue(
+                self._center_uniform,
+                QtGui.QVector2D(float(self.transform_state.center_x_mm), float(self.transform_state.center_y_mm)),
+            )
+            self._gl_program.setUniformValue(
+                self._viewport_uniform,
+                QtGui.QVector2D(float(max(1, self.width())), float(max(1, self.height()))),
+            )
+            self._gl_program.setUniformValue(self._scale_uniform, float(self.transform_state.pixels_per_mm))
+
+        def _draw_range(
+            self,
+            start_index: int,
+            end_index: int,
+            rgba: Tuple[float, float, float, float],
+            point_diameter_px: float,
+        ) -> None:
+            if self._gl_program is None or start_index > end_index or len(self._gl_batches) <= 0:
+                return
+            self._gl_program.setUniformValue(
+                self._color_uniform,
+                QtGui.QVector4D(float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])),
+            )
+            self._gl_program.setUniformValue(self._point_size_uniform, float(max(1.0, point_diameter_px)))
+            for batch in self._gl_batches:
+                batch_start = int(batch["global_start"])
+                batch_end = batch_start + int(batch["count"]) - 1
+                overlap_start = max(start_index, batch_start)
+                overlap_end = min(end_index, batch_end)
+                if overlap_end < overlap_start:
+                    continue
+                local_start = overlap_start - batch_start
+                draw_count = overlap_end - overlap_start + 1
+                buffer = batch["buffer"]
+                if not buffer.bind():
+                    continue
+                try:
+                    self._gl_program.enableAttributeArray(self._position_attribute)
+                    self._gl_program.setAttributeBuffer(self._position_attribute, GL_FLOAT, 0, 2, 8)
+                    self._gl_functions.glDrawArrays(GL_POINTS, int(local_start), int(draw_count))
+                    self._gl_program.disableAttributeArray(self._position_attribute)
+                finally:
+                    buffer.release()
+
+        def paintGL(self) -> None:
+            if self._gl_functions is None:
+                return
+            background_color = hex_to_qcolor(VIEWER_DEFAULT_BACKGROUND_COLOR)
+            self._gl_functions.glViewport(0, 0, int(max(1, self.width())), int(max(1, self.height())))
+            self._gl_functions.glClearColor(background_color.redF(), background_color.greenF(), background_color.blueF(), 1.0)
+            self._gl_functions.glClear(GL_COLOR_BUFFER_BIT)
+            if self._gl_program is None or len(self.points) <= 0:
+                return
+            self._gl_program.bind()
+            try:
+                self._set_common_uniforms()
+                self._draw_range(
+                    0,
+                    len(self.points) - 1,
+                    hex_to_rgba(VIEWER_BACKGROUND_COLOR),
+                    self._point_diameter_px(1.0),
+                )
+                if self.gray_range is not None:
+                    self._draw_range(
+                        self.gray_range[0],
+                        self.gray_range[1],
+                        hex_to_rgba(VIEWER_VISITED_COLOR),
+                        self._point_diameter_px(VIEWER_VISITED_SIZE_MULTIPLIER),
+                    )
+                if self.gradient_ranges:
+                    trail_colors = self._trail_rgba(len(self.gradient_ranges))
+                    for range_index, point_range in enumerate(self.gradient_ranges):
+                        self._draw_range(
+                            point_range[0],
+                            point_range[1],
+                            trail_colors[range_index],
+                            self._point_diameter_px(VIEWER_TRAIL_SIZE_MULTIPLIER),
+                        )
+            finally:
+                self._gl_program.release()
+
+        def paintEvent(self, event: Any) -> None:
+            super().paintEvent(event)
+            painter = QtGui.QPainter(self)
+            self._paint_overlay(painter)
+            painter.end()
+
+        def closeEvent(self, event: Any) -> None:
+            if self._gl_ready:
+                self.makeCurrent()
+                try:
+                    self._destroy_batches()
+                    if self._gl_program is not None:
+                        self._gl_program.removeAllShaders()
+                finally:
+                    self.doneCurrent()
+            super().closeEvent(event)
+
+        def framebuffer_has_non_background_pixels(self) -> bool:
+            if not self.isValid() or self.width() <= 0 or self.height() <= 0 or len(self.points) <= 0:
+                return True
+            image = self.grabFramebuffer()
+            if image.isNull():
+                return False
+            converted = image.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+            pixel_bytes = converted.bits().tobytes(converted.sizeInBytes())
+            pixels = np.frombuffer(pixel_bytes, dtype=np.uint8)
+            if pixels.size <= 0:
+                return False
+            pixels = pixels.reshape((converted.height(), converted.width(), 4))
+            background = hex_to_qcolor(VIEWER_DEFAULT_BACKGROUND_COLOR)
+            background_rgb = np.array([background.red(), background.green(), background.blue()], dtype=np.int16)
+            rgb_pixels = pixels[:, :, :3].astype(np.int16)
+            diff = np.abs(rgb_pixels - background_rgb)
+            return bool(np.any(np.max(diff, axis=2) > 2))
+
+    class RasterRenderBridge(QtCore.QObject):
+        rendered = QtCore.Signal(int, object, object)
+
+    class SequenceRasterView(SequenceViewMixin, QtWidgets.QWidget):
+        def __init__(
+            self,
+            transform_state: SharedTransformState,
+            coordinate_unit: str,
+            build_plate_width_mm: float,
+            build_plate_depth_mm: float,
+            origin_reference: str,
+            navigation_callback: Callable[[], None],
+        ) -> None:
+            super().__init__()
+            self._init_sequence_view(
+                transform_state,
+                coordinate_unit,
+                build_plate_width_mm,
+                build_plate_depth_mm,
+                origin_reference,
+                "Exact Raster",
+                navigation_callback,
+            )
+            self._bridge = RasterRenderBridge()
+            self._bridge.rendered.connect(self._on_background_rendered)
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sequence-raster-view")
+            self._background_image: Optional[QtGui.QImage] = None
+            self._background_snapshot: Optional[Dict[str, Any]] = None
+            self._pending_snapshot: Optional[Dict[str, Any]] = None
+            self._render_job_id = 0
+            self._idle_redraw_timer = QtCore.QTimer(self)
+            self._idle_redraw_timer.setSingleShot(True)
+            self._idle_redraw_timer.setInterval(VIEWER_RASTER_IDLE_REDRAW_MS)
+            self._idle_redraw_timer.timeout.connect(self._submit_exact_render)
+            self.setMinimumSize(320, 320)
+
+        def _background_snapshot_key(self, snapshot: Optional[Dict[str, Any]]) -> Optional[Tuple[Any, ...]]:
+            if snapshot is None:
+                return None
+            return (
+                int(snapshot["width_px"]),
+                int(snapshot["height_px"]),
+                round(float(snapshot["center_x_mm"]), 9),
+                round(float(snapshot["center_y_mm"]), 9),
+                round(float(snapshot["pixels_per_mm"]), 9),
+                round(float(snapshot["point_size_px"]), 6),
+                int(snapshot["point_count"]),
+            )
+
+        def _current_snapshot(self) -> Dict[str, Any]:
+            return {
+                "width_px": max(1, int(self.width())),
+                "height_px": max(1, int(self.height())),
+                "center_x_mm": float(self.transform_state.center_x_mm),
+                "center_y_mm": float(self.transform_state.center_y_mm),
+                "pixels_per_mm": float(self.transform_state.pixels_per_mm),
+                "point_size_px": float(self._point_diameter_px(1.0)),
+                "point_count": len(self.points),
+            }
+
+        def _schedule_exact_render(self, immediate: bool) -> None:
+            if immediate:
+                self._idle_redraw_timer.stop()
+                self._submit_exact_render()
+                return
+            self._idle_redraw_timer.start()
+
+        def _submit_exact_render(self) -> None:
+            snapshot = self._current_snapshot()
+            self._pending_snapshot = snapshot
+            self._render_job_id += 1
+            job_id = self._render_job_id
+            points_copy = np.ascontiguousarray(self.points, dtype=np.float32)
+
+            def on_done(future: Future, expected_job_id: int, expected_snapshot: Dict[str, Any]) -> None:
+                try:
+                    image = future.result()
+                except Exception:
+                    return
+                self._bridge.rendered.emit(expected_job_id, image, expected_snapshot)
+
+            future = self._executor.submit(render_raster_background_image, points_copy, snapshot)
+            future.add_done_callback(lambda future, jid=job_id, snap=snapshot: on_done(future, jid, snap))
+            self.update()
+
+        def _on_background_rendered(self, job_id: int, image: Any, snapshot: Any) -> None:
+            if job_id != self._render_job_id:
+                return
+            self._background_image = image
+            self._background_snapshot = snapshot
+            self.update()
+
+        def _on_transform_changed(self, _reason: str) -> None:
+            self._schedule_exact_render(immediate=False)
+            self.update()
+
+        def set_points(self, points: Any) -> None:
+            self._set_points_common(points)
+            self._background_image = None
+            self._background_snapshot = None
+            self._schedule_exact_render(immediate=True)
+
+        def set_marker_size_mm(self, point_size_mm: float) -> None:
+            self.point_size_mm = clamp_viewer_point_size_mm(point_size_mm)
+            self._schedule_exact_render(immediate=True)
+
+        def update_progress(
+            self,
+            progress: float,
+            trail_length: int,
+            gradient_window: int,
+            render_policy: ViewerRenderPolicy,
+        ) -> ViewerRenderStats:
+            stats = self._set_progress_common(progress, trail_length, gradient_window, render_policy)
+            self.update()
+            return stats
+
+        def resizeEvent(self, event: Any) -> None:
+            super().resizeEvent(event)
+            self._schedule_exact_render(immediate=False)
+
+        def _preview_target_rect(self, current_snapshot: Dict[str, Any], cached_snapshot: Dict[str, Any]) -> QtCore.QRectF:
+            old_scale = max(1e-6, float(cached_snapshot["pixels_per_mm"]))
+            new_scale = max(1e-6, float(current_snapshot["pixels_per_mm"]))
+            scale_ratio = new_scale / old_scale
+            width_old = float(cached_snapshot["width_px"])
+            height_old = float(cached_snapshot["height_px"])
+            translation_x = (
+                (float(cached_snapshot["center_x_mm"]) - float(current_snapshot["center_x_mm"])) * new_scale
+                + (float(current_snapshot["width_px"]) * 0.5)
+                - (width_old * 0.5 * scale_ratio)
+            )
+            translation_y = (
+                (float(current_snapshot["center_y_mm"]) - float(cached_snapshot["center_y_mm"])) * new_scale
+                + (float(current_snapshot["height_px"]) * 0.5)
+                - (height_old * 0.5 * scale_ratio)
+            )
+            return QtCore.QRectF(
+                translation_x,
+                translation_y,
+                width_old * scale_ratio,
+                height_old * scale_ratio,
+            )
+
+        def _draw_point_range(self, painter: QtGui.QPainter, point_range: Tuple[int, int], color: QtGui.QColor, multiplier: float) -> None:
+            start_index, end_index = point_range
+            if end_index < start_index or len(self.points) <= 0:
+                return
+            mapped_points = map_points_to_screen(
+                self.points[start_index : end_index + 1],
+                self.transform_state.center_x_mm,
+                self.transform_state.center_y_mm,
+                self.transform_state.pixels_per_mm,
+                max(1, self.width()),
+                max(1, self.height()),
+            )
+            draw_mapped_points(painter, mapped_points, color, self._point_diameter_px(multiplier))
+
+        def paintEvent(self, _event: Any) -> None:
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            painter.fillRect(self.rect(), hex_to_qcolor(VIEWER_DEFAULT_BACKGROUND_COLOR))
+
+            current_snapshot = self._current_snapshot()
+            exact_key = self._background_snapshot_key(self._background_snapshot)
+            current_key = self._background_snapshot_key(current_snapshot)
+            if self._background_image is not None and self._background_snapshot is not None:
+                if exact_key == current_key:
+                    painter.drawImage(0.0, 0.0, self._background_image)
+                else:
+                    painter.drawImage(
+                        self._preview_target_rect(current_snapshot, self._background_snapshot),
+                        self._background_image,
+                    )
+            elif self._pending_snapshot is not None:
+                painter.setPen(QtGui.QPen(hex_to_qcolor("#f0f0f0", 0.85)))
+                painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Rendering exact raster view...")
+
+            if self.gray_range is not None:
+                self._draw_point_range(
+                    painter,
+                    self.gray_range,
+                    hex_to_qcolor(VIEWER_VISITED_COLOR),
+                    VIEWER_VISITED_SIZE_MULTIPLIER,
+                )
+            if self.gradient_ranges:
+                trail_colors = self._trail_qcolors(len(self.gradient_ranges))
+                for range_index, point_range in enumerate(self.gradient_ranges):
+                    self._draw_point_range(
+                        painter,
+                        point_range,
+                        trail_colors[range_index],
+                        VIEWER_TRAIL_SIZE_MULTIPLIER,
+                    )
+
+            self._paint_overlay(painter)
+            painter.end()
+
+        def closeEvent(self, event: Any) -> None:
+            self._idle_redraw_timer.stop()
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            super().closeEvent(event)
 
     class SequencePanel(QtWidgets.QWidget):
-        """One scientific scatter view with static background and dynamic trail/head overlays."""
-
-        def __init__(self, title: str, coordinate_unit: str):
+        def __init__(
+            self,
+            title: str,
+            transform_state: SharedTransformState,
+            coordinate_unit: str,
+            build_plate_width_mm: float,
+            build_plate_depth_mm: float,
+            origin_reference: str,
+            backend_kind: str,
+            navigation_callback: Callable[[], None],
+        ) -> None:
             super().__init__()
-            self.points = np.empty((0, 2), dtype=float)
-            self.trail_brush_cache: Dict[int, List[Any]] = {}
-            self.last_render_key: Optional[Tuple[int, int, int, str]] = None
-            self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
-            self.current_gray_range: Optional[Tuple[int, int]] = None
-            self.point_size_mm = VIEWER_POINT_SIZE_MM_DEFAULT
-
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(8)
@@ -2546,154 +3932,35 @@ def run_interactive_viewer(payload_path: str) -> int:
             title_label.setFont(title_font)
             layout.addWidget(title_label)
 
-            self.plot_widget = pg.PlotWidget()
-            self.plot_widget.setMenuEnabled(False)
-            self.plot_widget.showGrid(x=True, y=True, alpha=0.18)
-            self.plot_widget.getPlotItem().hideButtons()
-            self.plot_widget.getPlotItem().setLabel("left", f"Y ({coordinate_unit})")
-            self.plot_widget.getPlotItem().setLabel("bottom", f"X ({coordinate_unit})")
-            self.plot_widget.getViewBox().setMouseEnabled(x=True, y=True)
-            layout.addWidget(self.plot_widget, 1)
-
-            self.background_item = pg.ScatterPlotItem(
-                size=VIEWER_POINT_SIZE_MM_DEFAULT,
-                pen=None,
-                brush=pg.mkBrush(VIEWER_BACKGROUND_COLOR),
-                pxMode=False,
-            )
-            self.visited_gray_item = pg.ScatterPlotItem(
-                size=VIEWER_POINT_SIZE_MM_DEFAULT * VIEWER_VISITED_SIZE_MULTIPLIER,
-                pen=None,
-                brush=pg.mkBrush(VIEWER_VISITED_COLOR),
-                pxMode=False,
-            )
-            self.trail_item = pg.ScatterPlotItem(
-                size=VIEWER_POINT_SIZE_MM_DEFAULT * VIEWER_TRAIL_SIZE_MULTIPLIER,
-                pen=None,
-                pxMode=False,
-            )
-            self.head_item = pg.ScatterPlotItem(
-                size=VIEWER_POINT_SIZE_MM_DEFAULT * VIEWER_HEAD_SIZE_MULTIPLIER,
-                pen=None,
-                brush=pg.mkBrush(VIEWER_HEAD_COLOR),
-                pxMode=False,
-            )
-            self.plot_widget.addItem(self.background_item)
-            self.plot_widget.addItem(self.visited_gray_item)
-            self.plot_widget.addItem(self.trail_item)
-            self.plot_widget.addItem(self.head_item)
-            self.set_marker_size_mm(VIEWER_POINT_SIZE_MM_DEFAULT)
+            if backend_kind == "opengl":
+                self.view_widget: Union[SequenceGLView, SequenceRasterView] = SequenceGLView(
+                    transform_state,
+                    coordinate_unit,
+                    build_plate_width_mm,
+                    build_plate_depth_mm,
+                    origin_reference,
+                    navigation_callback,
+                )
+            else:
+                self.view_widget = SequenceRasterView(
+                    transform_state,
+                    coordinate_unit,
+                    build_plate_width_mm,
+                    build_plate_depth_mm,
+                    origin_reference,
+                    navigation_callback,
+                )
+            layout.addWidget(self.view_widget, 1)
 
             self.point_label = QtWidgets.QLabel("Point 0 / 0")
             layout.addWidget(self.point_label)
 
-        def set_marker_size_mm(self, point_size_mm: float) -> None:
-            """Apply one base point size in millimetres to all viewer layers."""
-            self.point_size_mm = clamp_viewer_point_size_mm(point_size_mm)
-            self.background_item.setSize(self.point_size_mm)
-            self.visited_gray_item.setSize(self.point_size_mm * VIEWER_VISITED_SIZE_MULTIPLIER)
-            self.trail_item.setSize(self.point_size_mm * VIEWER_TRAIL_SIZE_MULTIPLIER)
-            self.head_item.setSize(self.point_size_mm * VIEWER_HEAD_SIZE_MULTIPLIER)
-
         def set_points(self, points: Any) -> None:
-            self.points = points
-            self.last_render_key = None
-            self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
-            self.current_gray_range = None
-            if len(points) == 0:
-                self.background_item.setData([], [])
-                self.visited_gray_item.setData([], [])
-                self.trail_item.setData([], [])
-                self.head_item.setData([], [])
-                self.point_label.setText("Point 0 / 0")
-                return
+            self.view_widget.set_points(points)
+            self.point_label.setText(self.view_widget.current_point_text())
 
-            self.background_item.setData(x=self.points[:, 0], y=self.points[:, 1])
-            self.visited_gray_item.setData([], [])
-            self.trail_item.setData([], [])
-            self.head_item.setData([], [])
-            self.point_label.setText(f"Point 1 / {len(self.points)}")
-            self.plot_widget.enableAutoRange()
-
-        def _get_trail_brushes(self, count: int) -> List[Any]:
-            brushes = self.trail_brush_cache.get(count)
-            if brushes is None:
-                brushes = [pg.mkBrush(color) for color in build_trail_colors(count)]
-                self.trail_brush_cache[count] = brushes
-            return brushes
-
-        def _update_visible_layers(
-            self,
-            base_index: int,
-            trail_length: int,
-            gradient_window: int,
-            render_policy: ViewerRenderPolicy,
-        ) -> ViewerRenderStats:
-            gray_range, gradient_range = compute_viewer_trail_ranges(
-                point_count=len(self.points),
-                base_index=base_index,
-                trail_length=trail_length,
-                gradient_window=gradient_window,
-            )
-
-            use_incremental_gray = render_policy.name in (
-                VIEWER_RENDER_POLICY_PLAYBACK.name,
-                VIEWER_RENDER_POLICY_NAVIGATION.name,
-            )
-            gray_displayed = self._apply_gray_range(gray_range, allow_incremental=use_incremental_gray)
-
-            if gradient_range is None:
-                self.trail_item.setData([], [])
-                gradient_displayed = 0
-            else:
-                gradient_points = self.points[gradient_range[0] : gradient_range[1] + 1]
-                gradient_displayed = len(gradient_points)
-                self.trail_item.setData(
-                    x=gradient_points[:, 0],
-                    y=gradient_points[:, 1],
-                    brush=self._get_trail_brushes(gradient_displayed),
-                )
-
-            gray_requested = 0 if gray_range is None else gray_range[1] - gray_range[0] + 1
-            gradient_requested = 0 if gradient_range is None else gradient_range[1] - gradient_range[0] + 1
-            return ViewerRenderStats(
-                requested_trail_count=gray_requested + gradient_requested,
-                requested_gradient_count=gradient_requested,
-                displayed_trail_count=gray_displayed + gradient_displayed,
-                displayed_gradient_count=gradient_displayed,
-                policy_name=render_policy.name,
-            )
-
-        def _apply_gray_range(self, gray_range: Optional[Tuple[int, int]], allow_incremental: bool) -> int:
-            if gray_range is None:
-                self.visited_gray_item.setData([], [])
-                self.current_gray_range = None
-                return 0
-
-            start_index, end_index = gray_range
-            if end_index < start_index:
-                self.visited_gray_item.setData([], [])
-                self.current_gray_range = None
-                return 0
-
-            if (
-                allow_incremental
-                and self.current_gray_range is not None
-                and start_index == self.current_gray_range[0]
-                and end_index >= self.current_gray_range[1]
-            ):
-                previous_end = self.current_gray_range[1]
-                if end_index > previous_end:
-                    new_points = self.points[previous_end + 1 : end_index + 1]
-                    if len(new_points) > 0:
-                        self.visited_gray_item.addPoints(x=new_points[:, 0], y=new_points[:, 1])
-                self.current_gray_range = (start_index, end_index)
-                return end_index - start_index + 1
-
-            gray_points = self.points[start_index : end_index + 1]
-            self.visited_gray_item.setData(x=gray_points[:, 0], y=gray_points[:, 1])
-            self.current_gray_range = (start_index, end_index)
-            return len(gray_points)
+        def set_marker_size_mm(self, point_size_mm: float) -> None:
+            self.view_widget.set_marker_size_mm(point_size_mm)
 
         def update_progress(
             self,
@@ -2702,61 +3969,22 @@ def run_interactive_viewer(payload_path: str) -> int:
             gradient_window: int,
             render_policy: ViewerRenderPolicy,
         ) -> ViewerRenderStats:
-            point_count = len(self.points)
-            if point_count == 0:
-                self.point_label.setText("Point 0 / 0")
-                self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
-                return VIEWER_EMPTY_RENDER_STATS
-
-            safe_progress = max(0.0, min(float(progress), point_count - 1))
-            base_index = min(max(int(safe_progress), 0), point_count - 1)
-            safe_trail_length = max(1, min(int(trail_length), point_count))
-            safe_gradient_window = max(1, min(int(gradient_window), point_count))
-            next_index = min(base_index + 1, point_count - 1)
-            segment_fraction = max(0.0, min(1.0, safe_progress - base_index))
-            start_point = self.points[base_index]
-            end_point = self.points[next_index]
-            head_x = float(start_point[0] + (end_point[0] - start_point[0]) * segment_fraction)
-            head_y = float(start_point[1] + (end_point[1] - start_point[1]) * segment_fraction)
-
-            render_key = (
-                base_index,
-                safe_trail_length,
-                safe_gradient_window,
-                render_policy.name,
-            )
-            if render_key != self.last_render_key:
-                self.last_render_stats = self._update_visible_layers(
-                    base_index,
-                    safe_trail_length,
-                    safe_gradient_window,
-                    render_policy,
-                )
-                self.last_render_key = render_key
-            self.head_item.setData([head_x], [head_y])
-            self.point_label.setText(f"Point {base_index + 1} / {point_count}")
-            return self.last_render_stats
+            stats = self.view_widget.update_progress(progress, trail_length, gradient_window, render_policy)
+            self.point_label.setText(self.view_widget.current_point_text())
+            return stats
 
         def pan_by_fraction(self, x_fraction: float, y_fraction: float) -> None:
-            view_box = self.plot_widget.getViewBox()
-            x_range, y_range = view_box.viewRange()
-            x_delta = (x_range[1] - x_range[0]) * x_fraction
-            y_delta = (y_range[1] - y_range[0]) * y_fraction
-            view_box.setRange(
-                xRange=(x_range[0] + x_delta, x_range[1] + x_delta),
-                yRange=(y_range[0] + y_delta, y_range[1] + y_delta),
-                padding=0.0,
-            )
+            self.view_widget.pan_by_fraction(x_fraction, y_fraction)
 
-        def reset_view(self) -> None:
-            self.plot_widget.enableAutoRange()
+        def viewport_size(self) -> QtCore.QSize:
+            return self.view_widget.size()
 
     class SequenceViewerWindow(QtWidgets.QMainWindow):
-        """Standalone scientific viewer with synchronised pan/zoom and live animation."""
-
-        def __init__(self, payload_data: Dict[str, Any]):
+        def __init__(self, payload_data: Dict[str, Any], backend_kind: str):
             super().__init__()
             self.payload = payload_data
+            self.backend_kind = backend_kind
+            self.backend_name = "OpenGL" if backend_kind == "opengl" else "Exact Raster"
             self.coordinate_scale_mm = float(payload_data.get("coordinate_scale_mm", DISPLAY_COORDINATE_SCALE_MM))
             self.coordinate_unit = str(payload_data.get("coordinate_unit", "mm"))
             self.build_plate_width_mm = float(payload_data.get("build_plate_width_mm", BUILD_PLATE_WIDTH_MM))
@@ -2766,14 +3994,13 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.results = [
                 {
                     **item,
-                    "original_points_np": np.asarray(item["original_points"], dtype=float) * self.coordinate_scale_mm,
-                    "optimized_points_np": np.asarray(item["optimized_points"], dtype=float) * self.coordinate_scale_mm,
+                    "original_points_np": np.asarray(item["original_points"], dtype=np.float32) * self.coordinate_scale_mm,
+                    "optimized_points_np": np.asarray(item["optimized_points"], dtype=np.float32) * self.coordinate_scale_mm,
                 }
                 for item in payload_data["results"]
             ]
             self.current_index = 0
             self.current_progress = 0.0
-            self.sync_guard = False
             self.last_render_stats = VIEWER_EMPTY_RENDER_STATS
             self.heavy_slider_drag_count = 0
             self.user_paused = False
@@ -2783,6 +4010,11 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.playback_points_per_second = VIEWER_POINTS_PER_SECOND_BASE
             self.playback_elapsed = QtCore.QElapsedTimer()
             self.point_size_mm = VIEWER_POINT_SIZE_MM_DEFAULT
+            self.transform_state = SharedTransformState()
+            self._home_reset_scheduled = False
+            self._initial_show_handled = False
+            self.request_backend_fallback = False
+            self.backend_fallback_reason = ""
 
             self.setWindowTitle(f"{payload_data.get('app_name', APP_DISPLAY_NAME)} - Interactive viewer")
             self.resize(1560, 920)
@@ -2888,8 +4120,26 @@ def run_interactive_viewer(payload_path: str) -> int:
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
             outer_layout.addWidget(splitter, 1)
 
-            self.original_panel = SequencePanel("Original", self.coordinate_unit)
-            self.optimized_panel = SequencePanel("Optimised", self.coordinate_unit)
+            self.original_panel = SequencePanel(
+                "Original",
+                self.transform_state,
+                self.coordinate_unit,
+                self.build_plate_width_mm,
+                self.build_plate_depth_mm,
+                self.origin_reference,
+                self.backend_kind,
+                self._on_manual_range_change,
+            )
+            self.optimized_panel = SequencePanel(
+                "Optimised",
+                self.transform_state,
+                self.coordinate_unit,
+                self.build_plate_width_mm,
+                self.build_plate_depth_mm,
+                self.origin_reference,
+                self.backend_kind,
+                self._on_manual_range_change,
+            )
             splitter.addWidget(self.original_panel)
             splitter.addWidget(self.optimized_panel)
             splitter.setSizes([780, 780])
@@ -2906,8 +4156,11 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.slider_refresh_timer.setSingleShot(True)
             self.slider_refresh_timer.setInterval(VIEWER_SLIDER_DRAG_INTERVAL_MS)
             self.slider_refresh_timer.timeout.connect(self._apply_throttled_slider_update)
+            self.opengl_diagnostic_timer = QtCore.QTimer(self)
+            self.opengl_diagnostic_timer.setSingleShot(True)
+            self.opengl_diagnostic_timer.setInterval(600)
+            self.opengl_diagnostic_timer.timeout.connect(self._diagnose_opengl_output)
 
-            self._connect_synced_views()
             self._sync_speed_controls_from_slider()
             self._sync_trail_inputs()
             self._sync_point_size_controls_from_slider()
@@ -2925,23 +4178,63 @@ def run_interactive_viewer(payload_path: str) -> int:
                 self.result_box.blockSignals(False)
                 self._set_result(initial_index)
                 self._start_playback()
+                self._schedule_opengl_diagnostic()
 
-        def _connect_synced_views(self) -> None:
-            left_view = self.original_panel.plot_widget.getViewBox()
-            right_view = self.optimized_panel.plot_widget.getViewBox()
+        def _schedule_home_reset(self) -> None:
+            if self._home_reset_scheduled:
+                return
+            self._home_reset_scheduled = True
+            QtCore.QTimer.singleShot(0, self._perform_scheduled_home_reset)
 
-            def sync_range(source_view: Any, target_view: Any) -> None:
-                if self.sync_guard:
-                    return
-                self.sync_guard = True
-                x_range, y_range = source_view.viewRange()
-                target_view.setRange(xRange=x_range, yRange=y_range, padding=0.0)
-                self.sync_guard = False
+        def _perform_scheduled_home_reset(self) -> None:
+            self._home_reset_scheduled = False
+            self._reset_views()
+            self._schedule_opengl_diagnostic()
 
-            left_view.sigRangeChanged.connect(lambda *_args: sync_range(left_view, right_view))
-            right_view.sigRangeChanged.connect(lambda *_args: sync_range(right_view, left_view))
-            left_view.sigRangeChangedManually.connect(self._on_manual_range_change)
-            right_view.sigRangeChangedManually.connect(self._on_manual_range_change)
+        def _schedule_opengl_diagnostic(self) -> None:
+            if self.backend_kind == "opengl" and self.results:
+                self.opengl_diagnostic_timer.start()
+
+        def _diagnose_opengl_output(self) -> None:
+            if self.backend_kind != "opengl" or not self.results or not self.isVisible():
+                return
+            original_view = getattr(self.original_panel, "view_widget", None)
+            optimized_view = getattr(self.optimized_panel, "view_widget", None)
+            panels_to_check: List[SequenceGLView] = []
+            if isinstance(original_view, SequenceGLView) and len(original_view.points) > 0:
+                panels_to_check.append(original_view)
+            if isinstance(optimized_view, SequenceGLView) and len(optimized_view.points) > 0:
+                panels_to_check.append(optimized_view)
+            if not panels_to_check:
+                return
+            if all(not panel.framebuffer_has_non_background_pixels() for panel in panels_to_check):
+                self.request_backend_fallback = True
+                self.backend_fallback_reason = (
+                    "Der OpenGL-Viewer hat trotz vorhandener Punkte ein leeres Framebuffer-Bild geliefert."
+                )
+                self.close()
+
+        def _current_result_bounds(self) -> Tuple[float, float, float, float]:
+            if not self.results:
+                return (-1.0, 1.0, -1.0, 1.0)
+            result = self.results[self.current_index]
+            point_sets = [result["original_points_np"], result["optimized_points_np"]]
+            non_empty_sets = [points for points in point_sets if len(points) > 0]
+            if not non_empty_sets:
+                return (-1.0, 1.0, -1.0, 1.0)
+            min_x = min(float(points[:, 0].min()) for points in non_empty_sets)
+            max_x = max(float(points[:, 0].max()) for points in non_empty_sets)
+            min_y = min(float(points[:, 1].min()) for points in non_empty_sets)
+            max_y = max(float(points[:, 1].max()) for points in non_empty_sets)
+            return (min_x, max_x, min_y, max_y)
+
+        def _current_viewport_size(self) -> QtCore.QSize:
+            original_size = self.original_panel.viewport_size()
+            optimized_size = self.optimized_panel.viewport_size()
+            return QtCore.QSize(
+                max(640, original_size.width(), optimized_size.width()),
+                max(640, original_size.height(), optimized_size.height()),
+            )
 
         def _current_point_count(self) -> int:
             if not self.results:
@@ -3007,11 +4300,9 @@ def run_interactive_viewer(payload_path: str) -> int:
         def _sync_trail_inputs(self) -> None:
             trail_length = self.trail_slider.value()
             gradient_window = self.gradient_slider.value()
-
             self.trail_input.blockSignals(True)
             self.trail_input.setValue(trail_length)
             self.trail_input.blockSignals(False)
-
             self.gradient_input.blockSignals(True)
             self.gradient_input.setValue(gradient_window)
             self.gradient_input.blockSignals(False)
@@ -3030,10 +4321,8 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.optimized_panel.set_marker_size_mm(self.point_size_mm)
 
         def _update_render_feedback(self) -> None:
-            trail_length = self.trail_slider.value()
-            gradient_window = self.gradient_slider.value()
-            self.trail_label.setText(f"{trail_length} points")
-            self.gradient_label.setText(f"{gradient_window} points")
+            self.trail_label.setText(f"{self.trail_slider.value()} points")
+            self.gradient_label.setText(f"{self.gradient_slider.value()} points")
 
         def _set_result(self, index: int) -> None:
             if not self.results:
@@ -3063,17 +4352,13 @@ def run_interactive_viewer(payload_path: str) -> int:
             trail_value = self.trail_slider.value()
             if trail_value > trail_maximum:
                 trail_value = trail_maximum
-            elif trail_value < 1:
-                trail_value = trail_default
-            elif trail_value == 1 and trail_maximum > 1:
+            elif trail_value < 1 or (trail_value == 1 and trail_maximum > 1):
                 trail_value = trail_default
 
             gradient_value = self.gradient_slider.value()
             if gradient_value > trail_maximum:
                 gradient_value = trail_maximum
-            elif gradient_value < 1:
-                gradient_value = gradient_default
-            elif gradient_value == 1 and trail_maximum > 1:
+            elif gradient_value < 1 or (gradient_value == 1 and trail_maximum > 1):
                 gradient_value = gradient_default
 
             self.trail_slider.setValue(trail_value)
@@ -3087,10 +4372,11 @@ def run_interactive_viewer(payload_path: str) -> int:
             self.original_panel.set_points(result["original_points_np"])
             self.optimized_panel.set_points(result["optimized_points_np"])
             self._apply_point_size_to_panels()
-            self._reset_views()
+            self._schedule_home_reset()
             self._update_info_label()
             self._sync_trail_inputs()
             self._update_panels()
+            self._schedule_opengl_diagnostic()
             if was_playing:
                 self._restart_playback_clock()
 
@@ -3104,7 +4390,8 @@ def run_interactive_viewer(payload_path: str) -> int:
                 f"Output name: {result['output_name']} | Points: {result['point_count']} | "
                 f"Coordinates shown in {self.coordinate_unit} | {origin_hint} | "
                 f"Build plate: {self.build_plate_width_mm:.0f} x {self.build_plate_depth_mm:.0f} {self.coordinate_unit} | "
-                f"Point spacing: {self.point_spacing_mm:.1f} {self.coordinate_unit}"
+                f"Point spacing: {self.point_spacing_mm:.1f} {self.coordinate_unit} | "
+                f"Viewer backend: {self.backend_name}"
             )
 
         def _points_per_second_from_slider_value(self, slider_value: int) -> float:
@@ -3170,6 +4457,7 @@ def run_interactive_viewer(payload_path: str) -> int:
         def _on_point_size_slider_changed(self, _value: int) -> None:
             self._sync_point_size_controls_from_slider()
             self._apply_point_size_to_panels()
+            self._schedule_opengl_diagnostic()
 
         def _on_point_size_input_changed(self, value: int) -> None:
             point_size_mm = viewer_point_size_input_um_to_mm(value)
@@ -3180,6 +4468,7 @@ def run_interactive_viewer(payload_path: str) -> int:
                 self.point_size_mm = point_size_mm
                 self._sync_point_size_controls_from_slider()
                 self._apply_point_size_to_panels()
+                self._schedule_opengl_diagnostic()
 
         def _on_heavy_slider_pressed(self) -> None:
             self.heavy_slider_drag_count += 1
@@ -3197,7 +4486,7 @@ def run_interactive_viewer(payload_path: str) -> int:
         def _apply_throttled_slider_update(self) -> None:
             self._update_panels()
 
-        def _on_manual_range_change(self, *_args: object) -> None:
+        def _on_manual_range_change(self) -> None:
             if not self.results:
                 return
             first_navigation_event = not self.navigation_active
@@ -3230,8 +4519,7 @@ def run_interactive_viewer(payload_path: str) -> int:
                 self._start_playback()
 
         def _reset_views(self) -> None:
-            self.original_panel.reset_view()
-            self.optimized_panel.reset_view()
+            self.transform_state.fit_bounds(self._current_result_bounds(), self._current_viewport_size(), "home")
 
         def _update_panels(self) -> None:
             if not self.results:
@@ -3261,15 +4549,9 @@ def run_interactive_viewer(payload_path: str) -> int:
             )
             self.last_render_stats = ViewerRenderStats(
                 requested_trail_count=max(original_stats.requested_trail_count, optimized_stats.requested_trail_count),
-                requested_gradient_count=max(
-                    original_stats.requested_gradient_count,
-                    optimized_stats.requested_gradient_count,
-                ),
+                requested_gradient_count=max(original_stats.requested_gradient_count, optimized_stats.requested_gradient_count),
                 displayed_trail_count=max(original_stats.displayed_trail_count, optimized_stats.displayed_trail_count),
-                displayed_gradient_count=max(
-                    original_stats.displayed_gradient_count,
-                    optimized_stats.displayed_gradient_count,
-                ),
+                displayed_gradient_count=max(original_stats.displayed_gradient_count, optimized_stats.displayed_gradient_count),
                 policy_name=render_policy.name,
             )
             self._update_render_feedback()
@@ -3277,15 +4559,20 @@ def run_interactive_viewer(payload_path: str) -> int:
         def _tick(self) -> None:
             if not self.results:
                 return
-            result = self.results[self.current_index]
-            point_count = max(len(result["original_points_np"]), len(result["optimized_points_np"]))
-            if point_count <= 1:
+            if self._current_point_count() <= 1:
                 self._update_panels()
                 return
             self._update_panels()
 
         def _on_result_changed(self, index: int) -> None:
             self._set_result(index)
+
+        def showEvent(self, event: Any) -> None:
+            super().showEvent(event)
+            if not self._initial_show_handled:
+                self._initial_show_handled = True
+                self._schedule_home_reset()
+            self._schedule_opengl_diagnostic()
 
         def keyPressEvent(self, event: Any) -> None:
             key = event.key()
@@ -3310,17 +4597,33 @@ def run_interactive_viewer(payload_path: str) -> int:
                 return
             super().keyPressEvent(event)
 
-    def launch_viewer(use_opengl: bool) -> int:
-        configure_viewer_graphics(use_opengl)
+    def launch_viewer(backend_kind: str) -> int:
+        if backend_kind == "opengl":
+            QtGui.QSurfaceFormat.setDefaultFormat(make_surface_format())
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         app.setApplicationName(APP_DISPLAY_NAME)
-        window = SequenceViewerWindow(payload)
+        if backend_kind == "opengl":
+            probe_opengl()
+        window = SequenceViewerWindow(payload, backend_kind)
         window.show()
-        return app.exec()
+        exit_code = app.exec()
+        if backend_kind == "opengl" and getattr(window, "request_backend_fallback", False):
+            raise RuntimeError(window.backend_fallback_reason or "OpenGL lieferte kein darstellbares Punktbild.")
+        return exit_code
 
+    normalized_backend = str(preferred_backend or "raster").strip().lower()
+    if normalized_backend not in {"raster", "opengl", "auto"}:
+        normalized_backend = "raster"
+    if normalized_backend == "opengl":
+        backend_order = ["opengl", "raster"]
+    else:
+        backend_order = ["raster", "opengl"]
+
+    first_backend = backend_order[0]
+    second_backend = backend_order[1]
     try:
-        return launch_viewer(use_opengl=True)
-    except Exception as opengl_exc:
+        return launch_viewer(first_backend)
+    except Exception as first_exc:
         try:
             app = QtWidgets.QApplication.instance()
             if app is not None:
@@ -3330,13 +4633,14 @@ def run_interactive_viewer(payload_path: str) -> int:
         except Exception:
             pass
         try:
-            return launch_viewer(use_opengl=False)
-        except Exception as fallback_exc:
+            return launch_viewer(second_backend)
+        except Exception as second_exc:
             show_fatal_error(
                 "Der interaktive Viewer konnte nicht gestartet werden.\n\n"
-                "Der OpenGL-Start ist fehlgeschlagen, und auch der Software-Fallback konnte nicht geladen werden.\n\n"
-                f"OpenGL-Hinweis:\n{opengl_exc}\n\n"
-                f"Software-Fallback:\n{fallback_exc}"
+                f"Der Start mit dem bevorzugten Backend '{first_backend}' ist fehlgeschlagen, "
+                f"und auch das alternative Backend '{second_backend}' konnte nicht geladen werden.\n\n"
+                f"{first_backend}-Hinweis:\n{first_exc}\n\n"
+                f"{second_backend}-Hinweis:\n{second_exc}"
             )
             return 1
 
@@ -3361,128 +4665,6 @@ def build_trail_colors(count: int) -> List[str]:
         interpolate_color(start_rgb, end_rgb, index / (count - 1))
         for index in range(count)
     ]
-
-
-def build_viewer_sampling_levels(point_count: int) -> Tuple[int, ...]:
-    """Precompute a light-weight stride ladder for adaptive viewer sampling."""
-    safe_point_count = max(1, int(point_count))
-    levels: Set[int] = {1}
-    current = 1
-
-    while current < safe_point_count:
-        if current < 16:
-            current += 1
-        elif current < 128:
-            current += 4
-        elif current < 1024:
-            current += 16
-        else:
-            current += 64
-        levels.add(min(current, safe_point_count))
-
-    return tuple(sorted(levels))
-
-
-def choose_viewer_sampling_stride(
-    requested_count: int,
-    max_points: int,
-    stride_levels: Sequence[int],
-) -> int:
-    """Choose a monotone stride that fits the requested point budget."""
-    if requested_count <= max_points:
-        return 1
-
-    safe_requested = max(1, int(requested_count))
-    safe_budget = max(1, int(max_points))
-    ideal_stride = max(1, int(math.ceil((safe_requested - 1) / max(1, safe_budget - 1))))
-
-    for stride in stride_levels:
-        if stride >= ideal_stride:
-            return stride
-    return ideal_stride
-
-
-def sample_viewer_index_range(
-    start_index: int,
-    end_index: int,
-    max_points: int,
-    stride_levels: Sequence[int],
-) -> Tuple[int, ...]:
-    """Stride-sample an inclusive index range while keeping the first and last point."""
-    if max_points <= 0 or end_index < start_index:
-        return tuple()
-
-    requested_count = end_index - start_index + 1
-    safe_budget = max(1, int(max_points))
-    if requested_count <= safe_budget:
-        return tuple(range(start_index, end_index + 1))
-    if safe_budget == 1:
-        return (end_index,)
-
-    stride = choose_viewer_sampling_stride(requested_count, safe_budget, stride_levels)
-    indices = list(range(start_index, end_index + 1, stride))
-    if not indices or indices[0] != start_index:
-        indices.insert(0, start_index)
-    if indices[-1] != end_index:
-        indices.append(end_index)
-    return tuple(indices)
-
-
-def allocate_viewer_dynamic_marker_budget(
-    gray_requested: int,
-    gradient_requested: int,
-    total_budget: int,
-) -> Tuple[int, int]:
-    """Distribute one dynamic-marker budget across gray and gradient highlight layers."""
-    safe_gray_requested = max(0, int(gray_requested))
-    safe_gradient_requested = max(0, int(gradient_requested))
-    safe_total_budget = max(0, int(total_budget))
-    total_requested = safe_gray_requested + safe_gradient_requested
-
-    if safe_total_budget <= 0 or total_requested <= 0:
-        return 0, 0
-    if total_requested <= safe_total_budget:
-        return safe_gray_requested, safe_gradient_requested
-    if safe_gray_requested <= 0:
-        return 0, min(safe_gradient_requested, safe_total_budget)
-    if safe_gradient_requested <= 0:
-        return min(safe_gray_requested, safe_total_budget), 0
-
-    minimum_gray = min(safe_gray_requested, 2 if safe_gray_requested > 1 else 1)
-    minimum_gradient = min(safe_gradient_requested, 2 if safe_gradient_requested > 1 else 1)
-    minimum_total = minimum_gray + minimum_gradient
-    if minimum_total > safe_total_budget:
-        if safe_gradient_requested >= safe_gray_requested:
-            return max(0, safe_total_budget - 1), 1
-        return 1, max(0, safe_total_budget - 1)
-
-    gray_budget = minimum_gray
-    gradient_budget = minimum_gradient
-    remaining_budget = safe_total_budget - minimum_total
-    gray_remaining = safe_gray_requested - gray_budget
-    gradient_remaining = safe_gradient_requested - gradient_budget
-    remaining_requested = gray_remaining + gradient_remaining
-
-    if remaining_budget > 0 and remaining_requested > 0:
-        gray_extra = min(gray_remaining, int(round(remaining_budget * gray_remaining / remaining_requested)))
-        gradient_extra = min(gradient_remaining, int(round(remaining_budget * gradient_remaining / remaining_requested)))
-        gray_budget += gray_extra
-        gradient_budget += gradient_extra
-
-        used_budget = gray_budget + gradient_budget
-        leftover = safe_total_budget - used_budget
-        while leftover > 0:
-            gray_unmet = safe_gray_requested - gray_budget
-            gradient_unmet = safe_gradient_requested - gradient_budget
-            if gradient_unmet <= 0 and gray_unmet <= 0:
-                break
-            if gradient_unmet >= gray_unmet and gradient_unmet > 0:
-                gradient_budget += 1
-            elif gray_unmet > 0:
-                gray_budget += 1
-            leftover -= 1
-
-    return gray_budget, gradient_budget
 
 
 def compute_viewer_trail_ranges(
@@ -3699,8 +4881,11 @@ class ComparisonApp(tk.Tk):
         self.ghost_delay = int(ghost_delay)
         self.forward_jump = int(forward_jump)
         self.backward_jump = int(backward_jump)
-        self.zip_entry_type = "infill"
+        self.zip_entry_types = ("infill",)
         self.zip_support_end_layer = 0
+        self.step_point_spacing_mm = STEP_POINT_SPACING_MM_DEFAULT
+        self.step_layer_height_mm = STEP_LAYER_HEIGHT_MM_DEFAULT
+        self.step_support_layer_count = STEP_SUPPORT_LAYER_COUNT_DEFAULT
         self.initial_files = tuple(initial_files)
         self.selected_input_files = tuple(initial_files)
         self.selected_sources: Tuple[InputSource, ...] = tuple()
@@ -3754,6 +4939,8 @@ class ComparisonApp(tk.Tk):
         self.current_operation_started_at: Optional[float] = None
         self.last_animation_prepare_seconds = 0.0
         self.viewer_processes: List[subprocess.Popen[Any]] = []
+        self.step_generated_artifacts: List[StepGeneratedArtifact] = []
+        self.step_layer_bundle_saved = False
 
         self.file_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Bitte Dateien auswaehlen.")
@@ -3809,6 +4996,13 @@ class ComparisonApp(tk.Tk):
         self.cancel_button.pack(side="left", padx=(10, 0))
         self.zip_button = ttk.Button(header, text="ZIP speichern...", command=self._save_zip, state="disabled")
         self.zip_button.pack(side="left", padx=(10, 0))
+        self.step_zip_button = ttk.Button(
+            header,
+            text="STEP-Layer speichern...",
+            command=self._save_step_layer_zip,
+            state="disabled",
+        )
+        self.step_zip_button.pack(side="left", padx=(10, 0))
         ttk.Button(header, text="Schliessen", command=self._handle_close).pack(side="left", padx=(10, 0))
 
         tk.Label(
@@ -3924,8 +5118,9 @@ class ComparisonApp(tk.Tk):
         tk.Label(
             action_frame,
             text=(
-                "Der Viewer laeuft in einem separaten Qt/PyQtGraph-Fenster mit Zoom, Panning, "
-                "Dateiauswahl, Animation und synchronisierten Achsen."
+                "Der Viewer laeuft in einem separaten Qt-Fenster mit exaktem Raster-Rendering "
+                "als Standard sowie optionalem OpenGL, inklusive Zoom, Panning, Dateiauswahl, "
+                "Animation und synchronisierten Achsen."
             ),
             bg="#111111",
             fg="#d0d0d0",
@@ -4376,6 +5571,99 @@ class ComparisonApp(tk.Tk):
 
         self._start_processing_flow(self.selected_input_files)
 
+    def _cleanup_step_generated_artifacts(self) -> None:
+        for artifact in self.step_generated_artifacts:
+            try:
+                shutil.rmtree(artifact.generated_zip_path.parent, ignore_errors=True)
+            except Exception:
+                pass
+        self.step_generated_artifacts = []
+        self.step_layer_bundle_saved = False
+        self.step_zip_button.config(state="disabled")
+
+    def _build_step_bounds_warning(self, artifact: StepGeneratedArtifact) -> Optional[str]:
+        bounds = artifact.manifest_data.get("xy_bounds_mm")
+        if not isinstance(bounds, dict):
+            return None
+
+        try:
+            min_x = float(bounds["min_x"])
+            max_x = float(bounds["max_x"])
+            min_y = float(bounds["min_y"])
+            max_y = float(bounds["max_y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        warnings: List[str] = []
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        if span_x > BUILD_PLATE_WIDTH_MM + 1e-9 or span_y > BUILD_PLATE_DEPTH_MM + 1e-9:
+            warnings.append(
+                f"Bounding Box {span_x:.3f} x {span_y:.3f} mm ist groesser als die Bauplatte "
+                f"{BUILD_PLATE_WIDTH_MM:.0f} x {BUILD_PLATE_DEPTH_MM:.0f} mm."
+            )
+        if (
+            min_x < -(BUILD_PLATE_WIDTH_MM * 0.5) - 1e-9
+            or max_x > (BUILD_PLATE_WIDTH_MM * 0.5) + 1e-9
+            or min_y < -(BUILD_PLATE_DEPTH_MM * 0.5) - 1e-9
+            or max_y > (BUILD_PLATE_DEPTH_MM * 0.5) + 1e-9
+        ):
+            warnings.append(
+                "Die Original-XY-Koordinaten liegen teilweise ausserhalb der um 0,0 zentrierten Bauplatte."
+            )
+
+        if not warnings:
+            return None
+        return f"{artifact.source_step_path.name}: " + " ".join(warnings)
+
+    def _save_step_layer_zip(self) -> bool:
+        if not self.step_generated_artifacts:
+            messagebox.showinfo("STEP-Layer speichern", "Es gibt keine generierten STEP-Layer in dieser Sitzung.", parent=self)
+            return False
+
+        if len(self.step_generated_artifacts) == 1:
+            artifact = self.step_generated_artifacts[0]
+            target_path = ask_for_zip_path(self, artifact.generated_zip_path.name)
+            if not target_path:
+                return False
+            try:
+                shutil.copyfile(artifact.generated_zip_path, target_path)
+            except Exception as exc:
+                messagebox.showerror(
+                    "STEP-Layer speichern",
+                    f"Das STEP-Layer-ZIP konnte nicht gespeichert werden:\n{exc}",
+                    parent=self,
+                )
+                return False
+
+            self.step_layer_bundle_saved = True
+            self.status_var.set(f"STEP-Layer-ZIP gespeichert: {target_path}")
+            messagebox.showinfo("Fertig", f"STEP-Layer-ZIP gespeichert:\n{target_path}", parent=self)
+            return True
+
+        bundle_path = ask_for_zip_path(self, "step_layer_archives.zip")
+        if not bundle_path:
+            return False
+
+        try:
+            with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for artifact in self.step_generated_artifacts:
+                    folder_name = re.sub(r"[^A-Za-z0-9._-]+", "_", artifact.source_step_path.stem).strip("._-") or "step_model"
+                    archive.write(artifact.generated_zip_path, arcname=f"{folder_name}/{artifact.generated_zip_path.name}")
+                    archive.write(artifact.manifest_json_path, arcname=f"{folder_name}/{artifact.manifest_json_path.name}")
+        except Exception as exc:
+            messagebox.showerror(
+                "STEP-Layer speichern",
+                f"Das STEP-Layer-Buendel konnte nicht gespeichert werden:\n{exc}",
+                parent=self,
+            )
+            return False
+
+        self.step_layer_bundle_saved = True
+        self.status_var.set(f"STEP-Layer-Buendel gespeichert: {bundle_path}")
+        messagebox.showinfo("Fertig", f"STEP-Layer-Buendel gespeichert:\n{bundle_path}", parent=self)
+        return True
+
     def _prompt_for_files(self) -> None:
         if self.processing_active:
             return
@@ -4416,24 +5704,118 @@ class ComparisonApp(tk.Tk):
         self.forward_jump = int(settings["forward_jump"])
         self.backward_jump = int(settings["backward_jump"])
 
-        input_sources: List[InputSource] = [normalize_input_source(file_path) for file_path in selected_files]
-        if any(Path(file_path).suffix.lower() == ".zip" for file_path in selected_files):
+        plain_files = [file_path for file_path in selected_files if Path(file_path).suffix.lower() not in {".zip", ".step", ".stp"}]
+        zip_files = [file_path for file_path in selected_files if Path(file_path).suffix.lower() == ".zip"]
+        step_files = [file_path for file_path in selected_files if is_step_file_path(file_path)]
+        input_sources: List[InputSource] = [normalize_input_source(file_path) for file_path in plain_files]
+        pending_step_settings: Optional[Dict[str, float]] = None
+        pending_zip_settings: Optional[Dict[str, object]] = None
+
+        if step_files:
+            pending_step_settings = ask_for_step_import_settings(
+                self,
+                current_point_spacing_mm=self.step_point_spacing_mm,
+                current_layer_height_mm=self.step_layer_height_mm,
+                current_support_layer_count=self.step_support_layer_count,
+            )
+            if pending_step_settings is None:
+                self.status_var.set("STEP-Import abgebrochen. Keine Verarbeitung gestartet.")
+                self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
+                return
+
+        if zip_files:
             zip_settings = ask_for_zip_import_settings(
                 self,
-                current_entry_type=self.zip_entry_type,
+                current_entry_types=self.zip_entry_types,
                 current_support_end_layer=self.zip_support_end_layer,
             )
             if zip_settings is None:
                 self.status_var.set("ZIP-Import abgebrochen. Keine Verarbeitung gestartet.")
                 self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
                 return
+            pending_zip_settings = zip_settings
 
-            self.zip_entry_type = str(zip_settings["entry_type"])
-            self.zip_support_end_layer = int(zip_settings["support_end_layer"])
+        self._cleanup_step_generated_artifacts()
 
-            input_sources, source_errors = build_input_sources(
-                selected_files,
-                zip_entry_type=self.zip_entry_type,
+        if pending_step_settings is not None:
+            self.step_point_spacing_mm = float(pending_step_settings["point_spacing_mm"])
+            self.step_layer_height_mm = float(pending_step_settings["layer_height_mm"])
+            self.step_support_layer_count = max(0, int(pending_step_settings["support_layer_count"]))
+            step_generation_errors: List[str] = []
+            step_generation_warnings: List[str] = []
+
+            for current_index, step_file_path in enumerate(step_files, start=1):
+                step_name = Path(step_file_path).name
+                self.status_var.set(f"STEP wird gesliced: {step_name}")
+                self.progress_var.set(
+                    f"{current_index} / {len(step_files)} STEP-Datei(en) werden zu B99-Layern umgesetzt."
+                )
+                self.update_idletasks()
+                try:
+                    artifact = run_modal_background_task(
+                        self,
+                        "STEP wird geladen",
+                        (
+                            f"{step_name} wird zu B99-Layern umgesetzt.\n\n"
+                            f"Punktabstand: {self.step_point_spacing_mm:.6g} mm | "
+                            f"Ebenendicke: {self.step_layer_height_mm:.6g} mm | "
+                            f"Stuetzschichten: {self.step_support_layer_count}"
+                        ),
+                        lambda step_file_path=step_file_path: generate_step_layer_artifact(
+                            step_file_path=step_file_path,
+                            point_spacing_mm=self.step_point_spacing_mm,
+                            layer_height_mm=self.step_layer_height_mm,
+                            support_layer_count=self.step_support_layer_count,
+                        ),
+                    )
+                except Exception as exc:
+                    step_generation_errors.append(f"{step_name}: {exc}")
+                    continue
+
+                self.step_generated_artifacts.append(artifact)
+                warning_message = self._build_step_bounds_warning(artifact)
+                if warning_message:
+                    step_generation_warnings.append(warning_message)
+
+            self.step_zip_button.config(state="normal" if self.step_generated_artifacts else "disabled")
+
+            if step_generation_warnings:
+                messagebox.showwarning(
+                    "STEP-Bounds",
+                    "Einige STEP-Modelle liegen ausserhalb der aktuellen Bauplatten-Annahme:\n\n"
+                    + "\n\n".join(step_generation_warnings),
+                    parent=self,
+                )
+
+            if step_generation_errors:
+                messagebox.showwarning(
+                    "STEP-Import",
+                    "Einige STEP-Dateien konnten nicht umgesetzt werden:\n\n" + "\n\n".join(step_generation_errors),
+                    parent=self,
+                )
+
+            if self.step_generated_artifacts:
+                step_input_sources, step_source_errors = build_input_sources(
+                    [str(artifact.generated_zip_path) for artifact in self.step_generated_artifacts],
+                    zip_entry_types=STEP_GENERATED_ZIP_ENTRY_TYPES,
+                    zip_support_end_layer=0,
+                )
+                if step_source_errors:
+                    messagebox.showwarning(
+                        "STEP-Import",
+                        "Einige generierte STEP-Layer konnten nicht geladen werden:\n\n"
+                        + "\n\n".join(step_source_errors),
+                        parent=self,
+                    )
+                input_sources.extend(step_input_sources)
+
+        if pending_zip_settings is not None:
+            self.zip_entry_types = normalize_zip_entry_types(pending_zip_settings["entry_types"])
+            self.zip_support_end_layer = int(pending_zip_settings["support_end_layer"])
+
+            zip_input_sources, source_errors = build_input_sources(
+                zip_files,
+                zip_entry_types=self.zip_entry_types,
                 zip_support_end_layer=self.zip_support_end_layer,
             )
             if source_errors:
@@ -4442,10 +5824,12 @@ class ComparisonApp(tk.Tk):
                     "Einige Eingaben konnten nicht aufgeloest werden:\n\n" + "\n\n".join(source_errors),
                     parent=self,
                 )
-            if not input_sources:
-                self.status_var.set("Keine gueltigen Eingaben nach ZIP-Filter gefunden.")
-                self.progress_var.set("Bitte andere ZIP-Parameter oder Dateien waehlen.")
-                return
+            input_sources.extend(zip_input_sources)
+
+        if not input_sources:
+            self.status_var.set("Keine gueltigen Eingaben gefunden.")
+            self.progress_var.set("Bitte andere Dateien oder Import-Parameter waehlen.")
+            return
 
         if self.mode in {"deterministic_grid_dispersion", "stochastic_grid_dispersion"}:
             preview_items, preview_errors = build_grid_preview_data(input_sources)
@@ -4829,8 +6213,21 @@ class ComparisonApp(tk.Tk):
             ],
         }
 
+    def _create_viewer_payload_file(self, selected_index: int) -> str:
+        """Write one temporary viewer payload file and return its path."""
+        payload = self._build_viewer_payload(selected_index)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".json",
+            prefix=VIEWER_PAYLOAD_PREFIX,
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle)
+            return handle.name
+
     def _open_interactive_viewer(self) -> None:
-        """Launch the separate Qt/PyQtGraph viewer for the currently processed results."""
+        """Launch the separate Qt viewer for the currently processed results."""
         if not self.results:
             messagebox.showinfo(APP_DISPLAY_NAME, "Es gibt noch keine Ergebnisse fuer den Viewer.", parent=self)
             return
@@ -4841,18 +6238,18 @@ class ComparisonApp(tk.Tk):
         except ValueError:
             selected_index = 0
 
-        payload = self._build_viewer_payload(selected_index)
-
         try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                suffix=".json",
-                prefix=VIEWER_PAYLOAD_PREFIX,
-                delete=False,
-            ) as handle:
-                json.dump(payload, handle)
-                payload_path = handle.name
+            self.status_var.set("Viewer wird vorbereitet...")
+            self.progress_var.set("Animationsdaten und Punktlisten werden fuer den externen Viewer gepackt.")
+            self.update_idletasks()
+            payload_path = str(
+                run_modal_background_task(
+                    self,
+                    "Viewer vorbereiten",
+                    "Die Daten fuer den interaktiven Viewer werden vorbereitet. Das Hauptfenster bleibt dabei bedienbar.",
+                    lambda: self._create_viewer_payload_file(selected_index),
+                )
+            )
         except Exception as exc:
             messagebox.showerror(APP_DISPLAY_NAME, f"Viewer-Payload konnte nicht erstellt werden:\n{exc}", parent=self)
             return
@@ -4869,7 +6266,7 @@ class ComparisonApp(tk.Tk):
                 APP_DISPLAY_NAME,
                 (
                     "Der interaktive Viewer konnte nicht gestartet werden.\n\n"
-                    "Bitte pruefen Sie, ob PySide6, pyqtgraph und numpy installiert sind.\n\n"
+                    "Bitte pruefen Sie, ob PySide6 und numpy installiert sind.\n\n"
                     f"Technischer Hinweis:\n{exc}"
                 ),
                 parent=self,
@@ -4882,6 +6279,7 @@ class ComparisonApp(tk.Tk):
 
         self.viewer_processes.append(viewer_process)
         self.status_var.set(f"Interaktiver Viewer gestartet fuer: {self.results[selected_index].source_label}")
+        self.progress_var.set("Viewer erfolgreich gestartet.")
 
     def _show_selected_animation(self) -> None:
         self._open_interactive_viewer()
@@ -5017,7 +6415,7 @@ class ComparisonApp(tk.Tk):
             parameter_lines.append("Zusaetzliche Parameter: keine")
 
         current_zip_name = build_default_zip_name([self.current_result], self.mode)
-        viewer_hint = "Interaktiver Viewer: separates Qt/PyQtGraph-Fenster fuer Zoom, Panning und Animation."
+        viewer_hint = "Interaktiver Viewer: separates Qt-Fenster mit exaktem Raster-Backend als Standard und optionalem OpenGL."
         coordinate_hint = (
             f"Anzeige in mm: x/y = ABS * {DISPLAY_COORDINATE_SCALE_MM:.0f} | "
             f"0,0 = Mittelpunkt | Bauplatte: {BUILD_PLATE_WIDTH_MM:.0f} x {BUILD_PLATE_DEPTH_MM:.0f} mm | "
@@ -5473,6 +6871,7 @@ class ComparisonApp(tk.Tk):
             self.mp_manager.shutdown()
         except Exception:
             pass
+        self._cleanup_step_generated_artifacts()
         self.destroy()
 
 
@@ -5510,9 +6909,34 @@ def run_self_tests() -> None:
         InputSource("file", "sample_abs_input.txt", "sample_abs_input.txt", "sample_abs_input.txt"),
         "interlaced_stripe_scanning",
     ) == "sample_abs_input_optimised_interlaced_stripe_scanning.txt"
+    assert _archive_member_keeps_original_name("figure files/37091.B99") is True
+    assert _archive_member_keeps_original_name("Figure Files/37091.B99") is True
+    assert _archive_member_keeps_original_name("inner/37091.B99") is False
+    assert build_output_name_for_source(
+        InputSource(
+            "zip_entry",
+            "sample.zip",
+            "sample.zip :: figure files/37091.B99",
+            "figure files/37091.B99",
+            "figure files/37091.B99",
+        ),
+        "density_adaptive_sampling",
+    ) == "figure files/37091.B99"
+    assert build_output_name_for_source(
+        InputSource(
+            "zip_entry",
+            "sample.zip",
+            "sample.zip :: inner/01021.B99",
+            "inner/01021.B99",
+            "inner/01021.B99",
+        ),
+        "density_adaptive_sampling",
+    ) == "inner/01021_optimised_density_adaptive_sampling.B99"
     assert parse_b99_archive_entry_name("12021.B99") == (12, "infill")
     assert parse_b99_archive_entry_name("12031.B99") == (12, "boundary")
     assert parse_b99_archive_entry_name("12091.B99") == (12, "combo")
+    assert normalize_zip_entry_types(None) == ("infill",)
+    assert normalize_zip_entry_types(("boundary", "infill", "boundary")) == ("boundary", "infill")
     assert set(select_bucket_candidates(list(range(10)), candidate_limit=4, randomized=False)) == {0, 1, 2, 3}
     seeded_candidates = select_bucket_candidates(
         list(range(10)),
@@ -5562,12 +6986,6 @@ def run_self_tests() -> None:
     assert len(colors) == 4
     assert colors[0] == "#ffffff"
     assert colors[-1] == "#ff1010"
-    assert build_viewer_sampling_levels(20)[0] == 1
-    assert build_viewer_sampling_levels(20)[-1] == 20
-    assert sample_viewer_index_range(0, 9, 4, (1, 2, 3, 4, 5)) == (0, 3, 6, 9)
-    assert sample_viewer_index_range(3, 7, 10, (1, 2, 3)) == (3, 4, 5, 6, 7)
-    assert allocate_viewer_dynamic_marker_budget(30, 70, 20) == (7, 13)
-    assert allocate_viewer_dynamic_marker_budget(0, 70, 20) == (0, 20)
     assert compute_viewer_trail_ranges(10, 8, 6, 3) == ((3, 5), (6, 8))
     assert compute_viewer_trail_ranges(10, 2, 6, 5) == (None, (0, 2))
     assert compute_viewer_trail_ranges(10, 9, 20, 20) == (None, (0, 9))
@@ -5748,17 +7166,25 @@ def run_self_tests() -> None:
             archive.writestr("inner/01021.B99", "ABS 0.0 0.0\nABS 1.0 1.0\n")
             archive.writestr("inner/02031.B99", "ABS 2.0 2.0\nABS 3.0 3.0\n")
             archive.writestr("inner/00021.B99", "ABS 9.0 9.0\n")
+            archive.writestr("figure files/37091.B99", "ABS 0.0 0.0\nABS 2.0 2.0\n")
             archive.writestr("inner/readme.txt", "ignored\n")
 
         input_sources, source_errors = build_input_sources(
             [str(archive_input_path)],
-            zip_entry_type="infill",
+            zip_entry_types=("infill",),
             zip_support_end_layer=0,
         )
         assert not source_errors
         assert len(input_sources) == 1
         assert input_sources[0].archive_member == "inner/01021.B99"
         assert input_sources[0].output_name == "inner/01021.B99"
+        dual_sources, dual_errors = build_input_sources(
+            [str(archive_input_path)],
+            zip_entry_types=("infill", "boundary"),
+            zip_support_end_layer=0,
+        )
+        assert not dual_errors
+        assert [source.archive_member for source in dual_sources] == ["inner/01021.B99", "inner/02031.B99"]
         assert build_output_name_for_source(input_sources[0], "stochastic_grid_dispersion") == (
             "inner/01021_optimised_stochastic_grid_dispersion.B99"
         )
@@ -5814,12 +7240,34 @@ def run_self_tests() -> None:
                 "inner/01021_optimised_local_greedy.B99",
                 "inner/02031.B99",
                 "inner/00021.B99",
+                "figure files/37091.B99",
                 "inner/readme.txt",
             }
             optimized_member = archive.read("inner/01021_optimised_local_greedy.B99").decode("utf-8")
             untouched_member = archive.read("inner/02031.B99").decode("utf-8")
             assert optimized_member == processed_zip_result.output_text
             assert untouched_member == "ABS 2.0 2.0\nABS 3.0 3.0\n"
+        combo_input_sources, combo_source_errors = build_input_sources(
+            [str(archive_input_path)],
+            zip_entry_types=("combo",),
+            zip_support_end_layer=0,
+        )
+        assert not combo_source_errors
+        assert len(combo_input_sources) == 1
+        assert combo_input_sources[0].archive_member == "figure files/37091.B99"
+        processed_combo_result = process_file(
+            combo_input_sources[0],
+            w1=W1_DEFAULT,
+            w2=W2_DEFAULT,
+            memory=MEMORY_DEFAULT,
+            mode="random_noise",
+        )
+        assert processed_combo_result.output_name == "figure files/37091.B99"
+        save_results_as_zip([processed_combo_result], str(zip_path))
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            assert "figure files/37091.B99" in archive.namelist()
+            assert not any(name.startswith("figure files/37091_optimised_") for name in archive.namelist())
         assert build_default_zip_name([worker_result], "local_greedy") == "_selftest_sample_abs_optimised_local_greedy.zip"
     finally:
         for path in (input_path, archive_input_path, output_path, zip_path):
@@ -5842,6 +7290,12 @@ def main() -> None:
         )
     )
     parser.add_argument("--viewer-payload", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--viewer-backend",
+        choices=("auto", "raster", "opengl"),
+        default=os.environ.get("SEQUENCE_VIEWER_BACKEND", "raster"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("input_files", nargs="*", help="Optionale Eingabedateien. Ohne Angabe erscheint der Explorer.")
     parser.add_argument("--w1", type=float, default=W1_DEFAULT, help="Gewicht fuer die Distanz zum aktuellen Punkt.")
     parser.add_argument("--w2", type=float, default=W2_DEFAULT, help="Gewicht fuer die Distanz zu den letzten Punkten.")
@@ -5894,7 +7348,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.viewer_payload:
-        sys.exit(run_interactive_viewer(args.viewer_payload))
+        sys.exit(run_interactive_viewer(args.viewer_payload, preferred_backend=args.viewer_backend))
 
     try:
         run_self_tests()
