@@ -4691,7 +4691,8 @@ def run_interactive_viewer(payload_path: str, preferred_backend: str = "raster")
             self.backend_fallback_reason = ""
 
             self.setWindowTitle(f"{payload_data.get('app_name', APP_DISPLAY_NAME)} - Interactive viewer")
-            self.resize(1560, 920)
+            
+            self.resize(1100, 750)
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -6269,9 +6270,7 @@ class ComparisonApp(tk.Tk):
         self.resize_refresh_job = None
         if self.current_result is None:
             return
-        self._prepare_canvas_view(self.original_panel.canvas, self.current_result.original_points)
-        self._prepare_canvas_view(self.optimized_panel.canvas, self.current_result.optimized_points)
-        self._draw_current_frame()
+        pass
 
     def _recalculate_current_files(self) -> None:
         """Restart processing for the already selected files with new parameters."""
@@ -7184,9 +7183,6 @@ class ComparisonApp(tk.Tk):
         self.progress_var.set("Animationsdaten werden vorbereitet")
         self.status_var.set("Animation wird vorbereitet")
         self._set_timer_text("Laufzeit", 0.0)
-        self._prepare_canvas_view(self.original_panel.canvas, self.current_result.original_points)
-        self._prepare_canvas_view(self.optimized_panel.canvas, self.current_result.optimized_points)
-        self._draw_current_frame()
 
         if self.loading_job is not None:
             self.after_cancel(self.loading_job)
