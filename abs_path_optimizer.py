@@ -287,6 +287,37 @@ MODE_ALIASES = {
 OPTIMIZATION_MODES = tuple(MODE_SPECS)
 
 
+# ---------------------------------------------------------------------------
+# Makro-Segmentierungstypen (Stufe 1)
+# ---------------------------------------------------------------------------
+MACRO_NONE = "keine_segmentierung"
+MACRO_CHESSBOARD = "schachbrett"
+MACRO_STRIPES = "streifen"
+MACRO_HEXAGONAL = "hexagonal"
+MACRO_SPIRAL_ZONES = "spiralzonen"
+
+MACRO_STRATEGIES: Dict[str, str] = {
+    MACRO_NONE: "Keine Segmentierung",
+    MACRO_CHESSBOARD: "Schachbrett (Island)",
+    MACRO_STRIPES: "Streifen (Stripe)",
+    MACRO_HEXAGONAL: "Hexagonal",
+    MACRO_SPIRAL_ZONES: "Spiralzonen (Konzentrisch)",
+}
+MACRO_STRATEGY_IDS = tuple(MACRO_STRATEGIES)
+MACRO_DEFAULT = MACRO_NONE
+MACRO_DEFAULT_SEG_SIZE_MM = 5.0
+MACRO_DEFAULT_SEG_OVERLAP_UM = 100.0
+MACRO_DEFAULT_ROTATION_DEG = 67.0
+MACRO_SEGMENT_ORDERS = (
+    "Schachbrett (schwarz→weiß)",
+    "Spirale (außen→innen)",
+    "Spirale (innen→außen)",
+    "Zufällig",
+    "Sequentiell (links→rechts)",
+)
+MACRO_DEFAULT_SEG_ORDER = MACRO_SEGMENT_ORDERS[0]
+
+
 @dataclass
 class ProcessedFileResult:
     source_path: Path
@@ -623,9 +654,19 @@ def generate_step_layer_artifact(
 
 
 def _classify_b99_type(type_digit: int) -> str:
-    """Classify the type digit from a B99 filename."""
+    """Classify the type digit from a B99 filename.
+
+    Convention per object:
+      Object 1: contour=1, infill=2
+      Object 2: contour=3, infill=4
+      Object 3: contour=5, infill=6
+      Object 4: contour=7, infill=8
+      Object 5: infill=9 (no contour file exists for this object)
+
+    Even digits and digit 9 are infill; odd digits (except 9) are boundary.
+    """
     if type_digit == 9:
-        return "combo"
+        return "infill"
     if type_digit % 2 == 0:
         return "infill"
     return "boundary"
@@ -1359,6 +1400,181 @@ def _optimize_island_raster(points: List[Point], island_size: float) -> List[Poi
     return [points[i] for i in result]
 
 
+# ---------------------------------------------------------------------------
+# Makro-Segmentierungsfunktionen (Stufe 1)
+# ---------------------------------------------------------------------------
+
+def _macro_order_cells(cells: List[Tuple[int, int]], seg_order: str) -> List[Tuple[int, int]]:
+    """Sort cell tuples (row, col) according to the chosen segment order."""
+    if not cells:
+        return cells
+    if "außen" in seg_order and "innen" in seg_order:
+        rows = [r for r, c in cells]
+        cols = [c for r, c in cells]
+        cr = sum(rows) / len(rows)
+        cc = sum(cols) / len(cols)
+        dists = [((r - cr) ** 2 + (c - cc) ** 2, (r, c)) for r, c in cells]
+        rev = "außen→innen" in seg_order
+        return [cell for _, cell in sorted(dists, reverse=rev)]
+    if "Zufällig" in seg_order:
+        import random as _rnd
+        rng = _rnd.Random(42)
+        arr = list(cells)
+        rng.shuffle(arr)
+        return arr
+    return sorted(cells, key=lambda rc: (rc[0], rc[1]))
+
+
+def segment_points_macro(
+    points: List[Point],
+    macro_type: str,
+    seg_size_mm: float = MACRO_DEFAULT_SEG_SIZE_MM,
+    seg_overlap_um: float = MACRO_DEFAULT_SEG_OVERLAP_UM,
+    seg_order: str = MACRO_DEFAULT_SEG_ORDER,
+    rotation_deg: float = 0.0,
+) -> List[List[Point]]:
+    """Split a point cloud into spatial segments according to the macro strategy.
+
+    Returns a list of point lists; each inner list is one segment to be
+    independently sorted by the micro strategy.
+    """
+    import numpy as np
+
+    if macro_type == MACRO_NONE or len(points) < 2:
+        return [list(points)]
+
+    pts = np.array(points, dtype=np.float64)
+    overlap_mm = max(0.0, seg_overlap_um) / 1000.0
+    safe_size = max(float(seg_size_mm), 0.1)
+
+    if macro_type == MACRO_CHESSBOARD:
+        return _segment_chessboard_np(pts, safe_size, seg_order, overlap_mm)
+    if macro_type == MACRO_STRIPES:
+        return _segment_stripes_np(pts, safe_size, rotation_deg, seg_order, overlap_mm)
+    if macro_type == MACRO_HEXAGONAL:
+        return _segment_hexagonal_np(pts, safe_size, seg_order)
+    if macro_type == MACRO_SPIRAL_ZONES:
+        return _segment_spiral_zones_np(pts, safe_size, seg_order)
+
+    return [list(points)]
+
+
+def _segment_chessboard_np(pts, seg_size: float, seg_order: str, overlap_mm: float) -> List[List[Point]]:
+    """Chessboard segmentation: phase A (even diag) then phase B (odd diag)."""
+    import numpy as np
+    min_x, min_y = float(pts[:, 0].min()), float(pts[:, 1].min())
+    x_rel = pts[:, 0] - min_x
+    y_rel = pts[:, 1] - min_y
+    half_ov = overlap_mm / 2.0
+
+    col_idx = (x_rel / seg_size).astype(int)
+    row_idx = (y_rel / seg_size).astype(int)
+
+    cell_keys_arr = np.stack([row_idx, col_idx], axis=1)
+    unique_cells = list(set(map(tuple, cell_keys_arr.tolist())))
+
+    phase_a = [(r, c) for (r, c) in unique_cells if (r + c) % 2 == 0]
+    phase_b = [(r, c) for (r, c) in unique_cells if (r + c) % 2 == 1]
+    phase_a = _macro_order_cells(phase_a, seg_order)
+    phase_b = _macro_order_cells(phase_b, seg_order)
+    ordered = phase_a + phase_b
+
+    segments: List[List[Point]] = []
+    for (r, c) in ordered:
+        if half_ov <= 0.0:
+            mask = (row_idx == r) & (col_idx == c)
+        else:
+            mask = (
+                (x_rel >= c * seg_size - half_ov) & (x_rel < (c + 1) * seg_size + half_ov) &
+                (y_rel >= r * seg_size - half_ov) & (y_rel < (r + 1) * seg_size + half_ov)
+            )
+        sel = pts[mask]
+        if len(sel) > 0:
+            segments.append([tuple(p) for p in sel.tolist()])
+    return segments
+
+
+def _segment_stripes_np(pts, seg_size: float, rotation: float, seg_order: str, overlap_mm: float) -> List[List[Point]]:
+    """Stripe segmentation: parallel bands perpendicular to the hatch direction."""
+    import numpy as np
+    cos_r = math.cos(math.radians(rotation))
+    sin_r = math.sin(math.radians(rotation))
+    cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+    rel_x = pts[:, 0] - cx
+    rel_y = pts[:, 1] - cy
+    rot_y = rel_x * sin_r + rel_y * cos_r
+
+    min_ry = float(rot_y.min())
+    rot_y_rel = rot_y - min_ry
+    half_ov = overlap_mm / 2.0
+
+    stripe_idx = (rot_y_rel / seg_size).astype(int)
+    unique_stripes = sorted(set(stripe_idx.tolist()))
+
+    if "Zufällig" in seg_order:
+        import random as _rnd
+        rng = _rnd.Random(42)
+        unique_stripes = list(unique_stripes)
+        rng.shuffle(unique_stripes)
+
+    segments: List[List[Point]] = []
+    for s in unique_stripes:
+        if half_ov <= 0.0:
+            mask = stripe_idx == s
+        else:
+            mask = (rot_y_rel >= s * seg_size - half_ov) & (rot_y_rel < (s + 1) * seg_size + half_ov)
+        sel = pts[mask]
+        if len(sel) > 0:
+            segments.append([tuple(p) for p in sel.tolist()])
+    return segments
+
+
+def _segment_hexagonal_np(pts, seg_size: float, seg_order: str) -> List[List[Point]]:
+    """Hexagonal segmentation: offset honeycomb grid, alternating phase A/B."""
+    import numpy as np
+    h = seg_size * math.sqrt(3)
+    v = seg_size * 1.5
+
+    min_x, min_y = float(pts[:, 0].min()), float(pts[:, 1].min())
+    row_idx = ((pts[:, 1] - min_y) / v).astype(int)
+    x_offset = np.where(row_idx % 2 == 1, h / 2.0, 0.0)
+    col_idx = ((pts[:, 0] - min_x - x_offset) / h).astype(int)
+
+    cell_keys_arr = np.stack([row_idx, col_idx], axis=1)
+    unique_cells = list(set(map(tuple, cell_keys_arr.tolist())))
+
+    phase_a = [(r, c) for (r, c) in unique_cells if (r + c) % 2 == 0]
+    phase_b = [(r, c) for (r, c) in unique_cells if (r + c) % 2 == 1]
+    ordered = _macro_order_cells(phase_a, seg_order) + _macro_order_cells(phase_b, seg_order)
+
+    segments: List[List[Point]] = []
+    for (r, c) in ordered:
+        mask = (row_idx == r) & (col_idx == c)
+        sel = pts[mask]
+        if len(sel) > 0:
+            segments.append([tuple(p) for p in sel.tolist()])
+    return segments
+
+
+def _segment_spiral_zones_np(pts, seg_size: float, seg_order: str) -> List[List[Point]]:
+    """Spiral zone segmentation: concentric rings around the centroid."""
+    import numpy as np
+    cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+    dist = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
+    ring_idx = (dist / seg_size).astype(int)
+    unique_rings = sorted(set(ring_idx.tolist()))
+
+    if "außen" in seg_order:
+        unique_rings = sorted(unique_rings, reverse=True)
+
+    segments: List[List[Point]] = []
+    for r in unique_rings:
+        sel = pts[ring_idx == r]
+        if len(sel) > 0:
+            segments.append([tuple(p) for p in sel.tolist()])
+    return segments
+
+
 def optimize_path(
     points: List[Point],
     w1: float = W1_DEFAULT,
@@ -1375,8 +1591,13 @@ def optimize_path(
     hilbert_order: int = HILBERT_ORDER_DEFAULT,
     spot_skip: int = SPOT_SKIP_DEFAULT,
     cancel_event: object = None,
+    macro_strategy: str = MACRO_NONE,
+    macro_seg_size_mm: float = MACRO_DEFAULT_SEG_SIZE_MM,
+    macro_seg_overlap_um: float = MACRO_DEFAULT_SEG_OVERLAP_UM,
+    macro_seg_order: str = MACRO_DEFAULT_SEG_ORDER,
+    macro_rotation_deg: float = 0.0,
 ) -> List[Point]:
-    """Optimize point order with the selected strategy."""
+    """Optimize point order with the selected two-stage strategy."""
     if not points:
         return []
 
@@ -1412,6 +1633,73 @@ def optimize_path(
         if progress_callback is not None:
             progress_callback(1.0, "1 / 1 Punkte optimiert")
         return points.copy()
+
+    # --- Stufe 1: Makro-Segmentierung ---
+    if macro_strategy != MACRO_NONE:
+        segments = segment_points_macro(
+            points,
+            macro_type=macro_strategy,
+            seg_size_mm=macro_seg_size_mm,
+            seg_overlap_um=macro_seg_overlap_um,
+            seg_order=macro_seg_order,
+            rotation_deg=macro_rotation_deg,
+        )
+        if progress_callback is not None:
+            progress_callback(0.05, f"{len(segments)} Segmente erstellt")
+
+        # --- Stufe 2: Mikro-Strategie pro Segment ---
+        combined: List[Point] = []
+        for seg_index, segment in enumerate(segments):
+            raise_if_cancelled(cancel_event)
+            if not segment:
+                continue
+            # For ghost_beam_scanning: only pre-sort with raster per segment;
+            # the ghost interleaving is applied after combining all segments.
+            if normalized_mode == "ghost_beam_scanning":
+                combined.extend(_optimize_raster_zigzag(segment))
+            else:
+                seg_result = optimize_path(
+                    segment,
+                    w1=w1,
+                    w2=w2,
+                    memory=memory,
+                    mode=mode,
+                    progress_callback=None,
+                    grid_spacing=grid_spacing,
+                    recent_percent=recent_percent,
+                    age_decay=age_decay,
+                    ghost_delay=ghost_delay,
+                    forward_jump=forward_jump,
+                    backward_jump=backward_jump,
+                    hilbert_order=hilbert_order,
+                    spot_skip=spot_skip,
+                    cancel_event=cancel_event,
+                    macro_strategy=MACRO_NONE,  # no further segmentation inside segments
+                )
+                combined.extend(seg_result)
+
+            if progress_callback is not None:
+                frac = 0.05 + 0.90 * ((seg_index + 1) / len(segments))
+                progress_callback(
+                    frac,
+                    f"Segment {seg_index + 1} / {len(segments)} fertig ({len(combined)} Punkte)",
+                )
+
+        # Ghost beam on the combined path (after merging all segments)
+        if normalized_mode == "ghost_beam_scanning":
+            total_steps = len(combined)
+            ghost_result: List[Point] = []
+            stripe_ranges = detect_source_stripe_ranges(combined)
+            for stripe_start, stripe_end in stripe_ranges:
+                raise_if_cancelled(cancel_event)
+                stripe_indices = list(range(stripe_start, stripe_end + 1))
+                reordered = reorder_ghost_beam_stripe_indices(stripe_indices, ghost_delay=ghost_delay)
+                ghost_result.extend(combined[i] for i in reordered)
+            combined = ghost_result
+
+        if progress_callback is not None:
+            progress_callback(1.0, f"{len(combined)} / {len(combined)} Punkte optimiert")
+        return combined
 
     if normalized_mode == "ghost_beam_scanning":
         total_steps = len(points)
@@ -1610,6 +1898,10 @@ def optimize_path(
         return [points[point_id] for point_id in optimized_ids]
 
     if normalized_mode == "density_adaptive_sampling":
+        if len(points) < 2:
+            if progress_callback is not None:
+                progress_callback(1.0, f"{len(points)} / {len(points)} Punkte unveraendert uebernommen")
+            return list(points)
         rng = random.Random()
         visited_cell_keys: Set[Tuple[int, int]] = set()
         start_id = rng.randrange(len(points))
@@ -1808,6 +2100,11 @@ def process_file(
     hilbert_order: int = HILBERT_ORDER_DEFAULT,
     spot_skip: int = SPOT_SKIP_DEFAULT,
     cancel_event: object = None,
+    macro_strategy: str = MACRO_NONE,
+    macro_seg_size_mm: float = MACRO_DEFAULT_SEG_SIZE_MM,
+    macro_seg_overlap_um: float = MACRO_DEFAULT_SEG_OVERLAP_UM,
+    macro_seg_order: str = MACRO_DEFAULT_SEG_ORDER,
+    macro_rotation_deg: float = 0.0,
 ) -> ProcessedFileResult:
     """Load, optimize and analyze one ABS file."""
     input_source = normalize_input_source(source)
@@ -1844,6 +2141,11 @@ def process_file(
         hilbert_order=hilbert_order,
         spot_skip=spot_skip,
         cancel_event=cancel_event,
+        macro_strategy=macro_strategy,
+        macro_seg_size_mm=macro_seg_size_mm,
+        macro_seg_overlap_um=macro_seg_overlap_um,
+        macro_seg_order=macro_seg_order,
+        macro_rotation_deg=macro_rotation_deg,
     )
     raise_if_cancelled(cancel_event)
 
@@ -2010,6 +2312,13 @@ def format_duration(seconds: float, include_tenths: bool = False) -> str:
     minutes, whole_seconds = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}"
 
+
+def _truncate_middle(s: str, max_len: int) -> str:
+    """Shorten a string by replacing its middle with an ellipsis."""
+    if len(s) <= max_len:
+        return s
+    half = (max_len - 3) // 2
+    return s[:half] + "..." + s[-(max_len - half - 3):]
 
 def print_analysis_for_file(result: ProcessedFileResult) -> None:
     """Print one file summary to the console."""
@@ -2326,6 +2635,11 @@ def ask_for_optimization_settings(
     current_backward_jump: int,
     current_hilbert_order: int = HILBERT_ORDER_DEFAULT,
     current_spot_skip: int = SPOT_SKIP_DEFAULT,
+    current_macro_strategy: str = MACRO_DEFAULT,
+    current_macro_seg_size_mm: float = MACRO_DEFAULT_SEG_SIZE_MM,
+    current_macro_seg_overlap_um: float = MACRO_DEFAULT_SEG_OVERLAP_UM,
+    current_macro_seg_order: str = MACRO_DEFAULT_SEG_ORDER,
+    current_macro_rotation_deg: float = MACRO_DEFAULT_ROTATION_DEG,
 ) -> Optional[Dict[str, object]]:
     """Ask for the processing mode and its mode-specific parameters."""
     dialog = tk.Toplevel(parent)
@@ -2336,6 +2650,15 @@ def ask_for_optimization_settings(
     dialog.configure(bg="#1a1a1a")
 
     result = {"value": None}
+    
+    # Macro variables
+    macro_strategy_var = tk.StringVar(value=MACRO_STRATEGIES.get(current_macro_strategy, MACRO_STRATEGIES[MACRO_NONE]))
+    macro_seg_size_var = tk.StringVar(value=f"{current_macro_seg_size_mm:.2f}")
+    macro_overlap_var = tk.StringVar(value=f"{current_macro_seg_overlap_um:.0f}")
+    macro_order_var = tk.StringVar(value=current_macro_seg_order)
+    macro_rotation_var = tk.StringVar(value=f"{current_macro_rotation_deg:.1f}")
+
+    # Micro variables
     mode_var = tk.StringVar(value=get_mode_label(current_mode))
     memory_var = tk.StringVar(value=str(current_memory))
     grid_spacing_var = tk.StringVar(value=f"{current_grid_spacing:.6g}")
@@ -2347,8 +2670,11 @@ def ask_for_optimization_settings(
     spot_skip_var = tk.StringVar(value=str(current_spot_skip))
     help_var = tk.StringVar()
     parameter_hint_var = tk.StringVar()
+    
     mode_labels = [MODE_SPECS[mode_id].label for mode_id in OPTIMIZATION_MODES]
     label_to_mode = {spec.label: spec.canonical_id for spec in MODE_SPECS.values()}
+    label_to_macro = {label: key for key, label in MACRO_STRATEGIES.items()}
+
 
     frame = tk.Frame(dialog, bg="#1a1a1a", padx=18, pady=16)
     frame.pack(fill="both", expand=True)
@@ -2361,19 +2687,53 @@ def ask_for_optimization_settings(
         font=("Segoe UI", 10, "bold"),
         justify="left",
         wraplength=460,
-    ).pack(anchor="w")
+    ).pack(anchor="w", pady=(0, 10))
 
-    form = tk.Frame(frame, bg="#1a1a1a")
-    form.pack(fill="x", pady=(14, 10))
+    content_frame = tk.Frame(frame, bg="#1a1a1a")
+    content_frame.pack(fill="both", expand=True)
+    
+    form = tk.Frame(content_frame, bg="#1a1a1a")
+    form.pack(side="left", fill="both", expand=True)
 
+    preview_frame = tk.Frame(content_frame, bg="#1a1a1a", width=200, padx=20)
+    preview_frame.pack(side="right", fill="y")
+    tk.Label(preview_frame, text="Vorschau Segmentierung", bg="#1a1a1a", fg="#cfcfcf", font=("Segoe UI", 9, "bold")).pack(anchor="n", pady=(0, 5))
+    macro_preview_canvas = tk.Canvas(preview_frame, width=150, height=150, bg="#2a2a2a", highlightthickness=1, highlightbackground="#444444")
+    macro_preview_canvas.pack(anchor="n")
+
+    # --- Stufe 1: Makro-Segmentierung ---
+    row_idx = 0
+    tk.Label(form, text="Stufe 1: Makro-Segmentierung", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10, "bold")).grid(row=row_idx, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    row_idx += 1
+    tk.Label(form, text="Typ", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(row=row_idx, column=0, sticky="w", pady=4)
+    macro_box = ttk.Combobox(form, textvariable=macro_strategy_var, values=list(MACRO_STRATEGIES.values()), state="readonly", width=34)
+    macro_box.grid(row=row_idx, column=1, sticky="we", pady=4)
+    row_idx += 1
+    
+    macro_size_label = tk.Label(form, text="Segmentgröße (mm)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    macro_size_spin = tk.Spinbox(form, from_=0.1, to=999.0, increment=1.0, textvariable=macro_seg_size_var, width=12, font=("Segoe UI", 10))
+    macro_overlap_label = tk.Label(form, text="Overlap (µm)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    macro_overlap_spin = tk.Spinbox(form, from_=0, to=5000, increment=50, textvariable=macro_overlap_var, width=12, font=("Segoe UI", 10))
+    macro_rotation_label = tk.Label(form, text="Rotation (°)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    macro_rotation_spin = tk.Spinbox(form, from_=0, to=360, increment=1, textvariable=macro_rotation_var, width=12, font=("Segoe UI", 10))
+    macro_order_label = tk.Label(form, text="Reihenfolge", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    macro_order_box = ttk.Combobox(form, textvariable=macro_order_var, values=MACRO_SEGMENT_ORDERS, state="readonly", width=34)
+
+    row_idx += 1
+    
+    # --- Stufe 2: Mikro-Strategie ---
+    tk.Label(form, text="Stufe 2: Mikro-Scan-Strategie", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10, "bold")).grid(row=row_idx, column=0, columnspan=2, sticky="w", pady=(12, 4))
+    row_idx += 1
+    
     tk.Label(form, text="Modus", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10)).grid(
-        row=0,
+        row=row_idx,
         column=0,
         sticky="w",
         pady=4,
     )
     mode_box = ttk.Combobox(form, textvariable=mode_var, values=mode_labels, state="readonly", width=34)
-    mode_box.grid(row=0, column=1, sticky="we", pady=4)
+    mode_box.grid(row=row_idx, column=1, sticky="we", pady=4)
+    row_idx += 1
 
     memory_label = tk.Label(form, text="Memory", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
     memory_spin = tk.Spinbox(form, from_=0, to=9999, textvariable=memory_var, width=12, font=("Segoe UI", 10))
@@ -2455,85 +2815,53 @@ def ask_for_optimization_settings(
         wraplength=460,
     )
 
-    memory_label.grid(
-        row=1,
-        column=0,
-        sticky="w",
-        pady=4,
-    )
-    memory_spin.grid(row=1, column=1, sticky="w", pady=4)
+    memory_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    memory_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    grid_spacing_label.grid(
-        row=2,
-        column=0,
-        sticky="w",
-        pady=4,
-    )
-    grid_spacing_entry.grid(row=2, column=1, sticky="w", pady=4)
+    grid_spacing_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    grid_spacing_entry.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    recent_percent_label.grid(
-        row=3,
-        column=0,
-        sticky="w",
-        pady=4,
-    )
-    recent_percent_spin.grid(row=3, column=1, sticky="w", pady=4)
+    recent_percent_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    recent_percent_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    ghost_delay_label.grid(
-        row=4,
-        column=0,
-        sticky="w",
-        pady=4,
-    )
-    ghost_delay_spin.grid(row=4, column=1, sticky="w", pady=4)
+    ghost_delay_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    ghost_delay_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    forward_jump_label.grid(
-        row=5,
-        column=0,
-        sticky="w",
-        pady=4,
-    )
-    forward_jump_spin.grid(row=5, column=1, sticky="w", pady=4)
+    forward_jump_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    forward_jump_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    backward_jump_label.grid(
-        row=6,
-        column=0,
-        sticky="w",
-        pady=4,
-    )
-    backward_jump_spin.grid(row=6, column=1, sticky="w", pady=4)
+    backward_jump_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    backward_jump_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    hilbert_order_label.grid(row=7, column=0, sticky="w", pady=4)
-    hilbert_order_spin.grid(row=7, column=1, sticky="w", pady=4)
+    hilbert_order_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    hilbert_order_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    spot_skip_label.grid(row=8, column=0, sticky="w", pady=4)
-    spot_skip_spin.grid(row=8, column=1, sticky="w", pady=4)
+    spot_skip_label.grid(row=row_idx, column=0, sticky="w", pady=4)
+    spot_skip_spin.grid(row=row_idx, column=1, sticky="w", pady=4)
+    row_idx += 1
 
-    age_decay_label.grid(
-        row=9,
-        column=0,
-        columnspan=2,
-        sticky="w",
-        pady=(8, 0),
-    )
-    parameter_hint_label.grid(
-        row=10,
-        column=0,
-        columnspan=2,
-        sticky="w",
-        pady=(10, 0),
-    )
+    age_decay_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    row_idx += 1
+    
+    parameter_hint_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", pady=(10, 0))
     form.grid_columnconfigure(1, weight=1)
 
     tk.Label(
-        frame,
+        content_frame,
         textvariable=help_var,
         bg="#1a1a1a",
         fg="#d0d0d0",
         font=("Segoe UI", 9),
         justify="left",
         wraplength=460,
-    ).pack(anchor="w", pady=(0, 14))
+    ).pack(side="bottom", anchor="w", pady=(0, 14), fill="x")
 
     button_row = tk.Frame(frame, bg="#1a1a1a")
     button_row.pack(fill="x")
@@ -2543,6 +2871,43 @@ def ask_for_optimization_settings(
         spec = get_mode_spec(selected_mode)
         visible_parameters = set(spec.visible_parameters)
 
+        selected_macro = label_to_macro.get(macro_strategy_var.get(), MACRO_NONE)
+        
+        # Macro widget visibility
+        macro_widgets = [
+            macro_size_label, macro_size_spin,
+            macro_overlap_label, macro_overlap_spin,
+            macro_rotation_label, macro_rotation_spin,
+            macro_order_label, macro_order_box
+        ]
+        if selected_macro == MACRO_NONE:
+            for w in macro_widgets: w.grid_remove()
+        else:
+            for w in macro_widgets: w.grid()
+            
+        # Draw preview
+        c = macro_preview_canvas
+        c.delete("all")
+        w, h = 150, 150
+        if selected_macro == MACRO_NONE:
+            c.create_rectangle(10, 10, w-10, h-10, fill="#333333", outline="#555555")
+            c.create_text(w/2, h/2, text="Gesamter Bereich", fill="#aaaaaa", font=("Segoe UI", 8))
+        elif selected_macro == MACRO_CHESSBOARD:
+            for r in range(4):
+                for col in range(4):
+                    color = "#4a4a4a" if (r+col)%2==0 else "#2a2a2a"
+                    c.create_rectangle(10+col*32, 10+r*32, 10+(col+1)*32, 10+(r+1)*32, fill=color, outline="#111111")
+        elif selected_macro == MACRO_STRIPES:
+            for i in range(5):
+                c.create_rectangle(10, 10+i*26, w-10, 10+(i+1)*26, fill="#333333", outline="#777777", width=2)
+        elif selected_macro == MACRO_HEXAGONAL:
+            c.create_text(w/2, h/2, text="Wabenstruktur", fill="#aaaaaa", font=("Segoe UI", 9))
+        elif selected_macro == MACRO_SPIRAL_ZONES:
+            for i in range(4):
+                rad = 60 - i*15
+                c.create_oval(w/2-rad, h/2-rad, w/2+rad, h/2+rad, fill="", outline="#777777", width=2)
+
+        # Micro widget visibility
         for widget in (memory_label, memory_spin):
             if MODE_PARAMETER_MEMORY in visible_parameters:
                 widget.grid()
@@ -2623,6 +2988,34 @@ def ask_for_optimization_settings(
         backward_jump_value = current_backward_jump
         hilbert_order_value = current_hilbert_order
         spot_skip_value = current_spot_skip
+
+        selected_macro = label_to_macro.get(macro_strategy_var.get(), MACRO_NONE)
+        macro_seg_size = current_macro_seg_size_mm
+        macro_overlap = current_macro_seg_overlap_um
+        macro_rotation = current_macro_rotation_deg
+
+        if selected_macro != MACRO_NONE:
+            try:
+                macro_seg_size = float(macro_seg_size_var.get())
+                if macro_seg_size <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Makro-Segmentierung", "Bitte fuer Segmentgröße eine positive Zahl eingeben.", parent=dialog)
+                return
+                
+            try:
+                macro_overlap = float(macro_overlap_var.get())
+                if macro_overlap < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Makro-Segmentierung", "Bitte fuer Overlap eine nicht-negative Zahl eingeben.", parent=dialog)
+                return
+                
+            try:
+                macro_rotation = float(macro_rotation_var.get())
+            except ValueError:
+                messagebox.showerror("Makro-Segmentierung", "Bitte fuer Rotation eine Zahl eingeben.", parent=dialog)
+                return
 
         if MODE_PARAMETER_MEMORY in visible_parameters:
             try:
@@ -2717,6 +3110,11 @@ def ask_for_optimization_settings(
             "backward_jump": backward_jump_value,
             "hilbert_order": hilbert_order_value,
             "spot_skip": spot_skip_value,
+            "macro_strategy": selected_macro,
+            "macro_seg_size_mm": macro_seg_size,
+            "macro_seg_overlap_um": macro_overlap,
+            "macro_seg_order": macro_order_var.get(),
+            "macro_rotation_deg": macro_rotation,
         }
         dialog.destroy()
 
@@ -2724,9 +3122,10 @@ def ask_for_optimization_settings(
     ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(side="left", padx=(10, 0))
 
     mode_box.bind("<<ComboboxSelected>>", lambda _event: update_mode_fields())
+    macro_box.bind("<<ComboboxSelected>>", lambda _event: update_mode_fields())
     update_mode_fields()
     center_toplevel(parent, dialog)
-    mode_box.focus_set()
+    macro_box.focus_set()
     dialog.wait_window()
     return result["value"]
 
@@ -5080,6 +5479,11 @@ def process_file_in_subprocess(
     hilbert_order: int = HILBERT_ORDER_DEFAULT,
     spot_skip: int = SPOT_SKIP_DEFAULT,
     cancel_event: object = None,
+    macro_strategy: str = MACRO_NONE,
+    macro_seg_size_mm: float = MACRO_DEFAULT_SEG_SIZE_MM,
+    macro_seg_overlap_um: float = MACRO_DEFAULT_SEG_OVERLAP_UM,
+    macro_seg_order: str = MACRO_DEFAULT_SEG_ORDER,
+    macro_rotation_deg: float = 0.0,
 ) -> Tuple[int, int, str, ProcessedFileResult]:
     """Process one file in a separate process and forward progress messages."""
     normalized_source = normalize_input_source(input_source)
@@ -5105,6 +5509,11 @@ def process_file_in_subprocess(
         hilbert_order=hilbert_order,
         spot_skip=spot_skip,
         cancel_event=cancel_event,
+        macro_strategy=macro_strategy,
+        macro_seg_size_mm=macro_seg_size_mm,
+        macro_seg_overlap_um=macro_seg_overlap_um,
+        macro_seg_order=macro_seg_order,
+        macro_rotation_deg=macro_rotation_deg,
     )
     return (file_index, total_files, file_name, result)
 
@@ -5164,6 +5573,11 @@ class ComparisonApp(tk.Tk):
         self.backward_jump = int(backward_jump)
         self.hilbert_order = int(hilbert_order)
         self.spot_skip = int(spot_skip)
+        self.macro_strategy = MACRO_DEFAULT
+        self.macro_seg_size_mm = MACRO_DEFAULT_SEG_SIZE_MM
+        self.macro_seg_overlap_um = MACRO_DEFAULT_SEG_OVERLAP_UM
+        self.macro_seg_order = MACRO_DEFAULT_SEG_ORDER
+        self.macro_rotation_deg = MACRO_DEFAULT_ROTATION_DEG
         self.zip_entry_types = ("infill",)
         self.zip_support_end_layer = 0
         self.step_point_spacing_mm = STEP_POINT_SPACING_MM_DEFAULT
@@ -5226,7 +5640,7 @@ class ComparisonApp(tk.Tk):
         self.step_layer_bundle_saved = False
 
         self.file_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Bitte Dateien auswaehlen.")
+        self.status_var = tk.StringVar(value="Willkommen – Dateien ueber 'Laden' auswaehlen")
         self.progress_var = tk.StringVar(value="Noch keine Verarbeitung gestartet.")
         self.timer_var = tk.StringVar(value="Laufzeit: 00:00:00.0")
         self.original_label_var = tk.StringVar(value="Punkt 0 / 0")
@@ -5251,50 +5665,75 @@ class ComparisonApp(tk.Tk):
         self._build_ui()
         self._update_animation_speed_label()
         self._update_trail_count_label()
-        self._reset_preview("Bitte zuerst Dateien auswaehlen und verarbeiten.")
+        self._reset_preview("Bitte zuerst Dateien laden.")
 
         if self.initial_files:
             self.after(200, lambda: self._start_processing_flow(self.initial_files))
-        else:
-            self.after(250, self._prompt_for_files)
 
     def _build_ui(self) -> None:
-        header = tk.Frame(self, bg="#181818", padx=14, pady=12)
+        style = ttk.Style()
+        style.configure("Header.TButton", font=("Segoe UI", 9), padding=(10, 5))
+
+        header = tk.Frame(self, bg="#1e1e1e", padx=14, pady=10)
         header.pack(fill="x")
 
-        ttk.Button(header, text="Dateien auswaehlen...", command=self._prompt_for_files).pack(side="left")
+        # --- Group 1: Load / Calculate ---
+        ttk.Button(
+            header, text="Dateien laden", command=self._load_files_preview, style="Header.TButton",
+        ).pack(side="left")
         self.recalculate_button = ttk.Button(
             header,
-            text="Neu berechnen...",
+            text="Strategie berechnen...",
             command=self._recalculate_current_files,
             state="normal" if self.selected_input_files else "disabled",
+            style="Header.TButton",
         )
-        self.recalculate_button.pack(side="left", padx=(10, 0))
+        self.recalculate_button.pack(side="left", padx=(6, 0))
+
+        # --- Separator 1 ---
+        tk.Frame(header, bg="#444444", width=1).pack(side="left", fill="y", padx=(12, 12), pady=2)
+
+        # --- Group 2: Actions ---
         self.cancel_button = ttk.Button(
             header,
             textvariable=self.cancel_button_var,
             command=self._cancel_active_work,
             state="disabled",
+            style="Header.TButton",
         )
-        self.cancel_button.pack(side="left", padx=(10, 0))
-        self.zip_button = ttk.Button(header, text="ZIP speichern...", command=self._save_zip, state="disabled")
-        self.zip_button.pack(side="left", padx=(10, 0))
+        self.cancel_button.pack(side="left")
+        self.zip_button = ttk.Button(
+            header, text="ZIP speichern...", command=self._save_zip, state="disabled", style="Header.TButton",
+        )
+        self.zip_button.pack(side="left", padx=(6, 0))
         self.step_zip_button = ttk.Button(
             header,
             text="STEP-Layer speichern...",
             command=self._save_step_layer_zip,
             state="disabled",
+            style="Header.TButton",
         )
-        self.step_zip_button.pack(side="left", padx=(10, 0))
-        ttk.Button(header, text="Schliessen", command=self._handle_close).pack(side="left", padx=(10, 0))
+        self.step_zip_button.pack(side="left", padx=(6, 0))
 
+        # --- Separator 2 ---
+        tk.Frame(header, bg="#444444", width=1).pack(side="left", fill="y", padx=(12, 12), pady=2)
+
+        # --- Group 3: Window ---
+        ttk.Button(
+            header, text="Schliessen", command=self._handle_close, style="Header.TButton",
+        ).pack(side="left")
+
+        # --- Compact status hint (right-aligned, subdued) ---
         tk.Label(
             header,
             textvariable=self.status_var,
-            bg="#181818",
-            fg="#d0d0d0",
-            font=("Segoe UI", 10),
+            bg="#1e1e1e",
+            fg="#888888",
+            font=("Segoe UI", 9),
         ).pack(side="right")
+
+        # Thin separator line below header
+        tk.Frame(self, bg="#333333", height=1).pack(fill="x")
 
         body_container = tk.Frame(self, bg="#111111")
         body_container.pack(fill="both", expand=True)
@@ -5948,18 +6387,103 @@ class ComparisonApp(tk.Tk):
         return True
 
     def _prompt_for_files(self) -> None:
+        """Legacy alias kept for compatibility."""
+        self._load_files_preview()
+
+    def _load_files_preview(self) -> None:
+        """Load files and show the original scan immediately (no optimisation dialog)."""
         if self.processing_active:
             return
 
         selected_files = ask_for_input_files(self)
         if not selected_files:
-            self.status_var.set("Keine Dateien ausgewaehlt. Das Fenster bleibt offen.")
-            self.progress_var.set("Bitte ueber 'Dateien auswaehlen...' erneut starten.")
+            self.status_var.set("Keine Dateien ausgewaehlt.")
+            self.progress_var.set("Bitte ueber 'Dateien laden' erneut starten.")
             return
 
         self.selected_input_files = tuple(selected_files)
         self.recalculate_button.config(state="normal")
-        self._start_processing_flow(selected_files)
+
+        # Use direct_visualisation for instant preview (no reordering)
+        saved_mode = self.mode
+        self.mode = "direct_visualisation"
+        plain_files = [f for f in selected_files if Path(f).suffix.lower() not in {".zip", ".step", ".stp"}]
+        zip_files = [f for f in selected_files if Path(f).suffix.lower() == ".zip"]
+        step_files = [f for f in selected_files if is_step_file_path(f)]
+        input_sources: List[InputSource] = [normalize_input_source(f) for f in plain_files]
+
+        if step_files:
+            step_settings = ask_for_step_import_settings(
+                self,
+                current_point_spacing_mm=self.step_point_spacing_mm,
+                current_layer_height_mm=self.step_layer_height_mm,
+                current_support_layer_count=self.step_support_layer_count,
+            )
+            if step_settings is None:
+                self.mode = saved_mode
+                self.status_var.set("STEP-Import abgebrochen.")
+                return
+            self.step_point_spacing_mm = float(step_settings["point_spacing_mm"])
+            self.step_layer_height_mm = float(step_settings["layer_height_mm"])
+            self.step_support_layer_count = max(0, int(step_settings["support_layer_count"]))
+            self._cleanup_step_generated_artifacts()
+            for step_file_path in step_files:
+                step_name = Path(step_file_path).name
+                self.status_var.set(f"STEP wird gesliced: {step_name}")
+                self.update_idletasks()
+                try:
+                    artifact = run_modal_background_task(
+                        self,
+                        "STEP wird geladen",
+                        f"{step_name} wird zu B99-Layern umgesetzt.",
+                        lambda sfp=step_file_path: generate_step_layer_artifact(
+                            step_file_path=sfp,
+                            point_spacing_mm=self.step_point_spacing_mm,
+                            layer_height_mm=self.step_layer_height_mm,
+                            support_layer_count=self.step_support_layer_count,
+                        ),
+                    )
+                    self.step_generated_artifacts.append(artifact)
+                except Exception as exc:
+                    messagebox.showwarning("STEP-Import", f"{step_name}: {exc}", parent=self)
+            self.step_zip_button.config(state="normal" if self.step_generated_artifacts else "disabled")
+            if self.step_generated_artifacts:
+                step_sources, _ = build_input_sources(
+                    [str(a.generated_zip_path) for a in self.step_generated_artifacts],
+                    zip_entry_types=STEP_GENERATED_ZIP_ENTRY_TYPES,
+                    zip_support_end_layer=0,
+                )
+                input_sources.extend(step_sources)
+
+        if zip_files:
+            zip_settings = ask_for_zip_import_settings(
+                self,
+                current_entry_types=self.zip_entry_types,
+                current_support_end_layer=self.zip_support_end_layer,
+            )
+            if zip_settings is None:
+                self.mode = saved_mode
+                self.status_var.set("ZIP-Import abgebrochen.")
+                return
+            self.zip_entry_types = normalize_zip_entry_types(zip_settings["entry_types"])
+            self.zip_support_end_layer = int(zip_settings["support_end_layer"])
+            zip_sources, zip_errors = build_input_sources(
+                zip_files,
+                zip_entry_types=self.zip_entry_types,
+                zip_support_end_layer=self.zip_support_end_layer,
+            )
+            if zip_errors:
+                messagebox.showwarning("ZIP-Import", "\n\n".join(zip_errors), parent=self)
+            input_sources.extend(zip_sources)
+
+        if not input_sources:
+            self.mode = saved_mode
+            self.status_var.set("Keine gueltigen Eingaben gefunden.")
+            self.progress_var.set("Bitte andere Dateien waehlen.")
+            return
+
+        self.start_processing(input_sources)
+        self.mode = saved_mode
 
     def _start_processing_flow(self, selected_files: Sequence[str]) -> None:
         """Ask for the optimization settings and then start file processing."""
@@ -5974,6 +6498,11 @@ class ComparisonApp(tk.Tk):
             current_backward_jump=self.backward_jump,
             current_hilbert_order=self.hilbert_order,
             current_spot_skip=self.spot_skip,
+            current_macro_strategy=self.macro_strategy,
+            current_macro_seg_size_mm=self.macro_seg_size_mm,
+            current_macro_seg_overlap_um=self.macro_seg_overlap_um,
+            current_macro_seg_order=self.macro_seg_order,
+            current_macro_rotation_deg=self.macro_rotation_deg,
         )
         if settings is None:
             self.status_var.set("Dateiauswahl abgebrochen. Keine Verarbeitung gestartet.")
@@ -5990,6 +6519,11 @@ class ComparisonApp(tk.Tk):
         self.backward_jump = int(settings["backward_jump"])
         self.hilbert_order = int(settings.get("hilbert_order", HILBERT_ORDER_DEFAULT))
         self.spot_skip = int(settings.get("spot_skip", SPOT_SKIP_DEFAULT))
+        self.macro_strategy = str(settings.get("macro_strategy", MACRO_DEFAULT))
+        self.macro_seg_size_mm = float(settings.get("macro_seg_size_mm", MACRO_DEFAULT_SEG_SIZE_MM))
+        self.macro_seg_overlap_um = float(settings.get("macro_seg_overlap_um", MACRO_DEFAULT_SEG_OVERLAP_UM))
+        self.macro_seg_order = str(settings.get("macro_seg_order", MACRO_DEFAULT_SEG_ORDER))
+        self.macro_rotation_deg = float(settings.get("macro_rotation_deg", MACRO_DEFAULT_ROTATION_DEG))
 
         plain_files = [file_path for file_path in selected_files if Path(file_path).suffix.lower() not in {".zip", ".step", ".stp"}]
         zip_files = [file_path for file_path in selected_files if Path(file_path).suffix.lower() == ".zip"]
@@ -6399,9 +6933,21 @@ class ComparisonApp(tk.Tk):
         elapsed_seconds = 0.0
         if self.current_operation_started_at is not None:
             elapsed_seconds = time.perf_counter() - self.current_operation_started_at
-        self._set_timer_text("Laufzeit", elapsed_seconds)
+
+        # ETA calculation
+        fraction = getattr(self, "current_progress_fraction", 0.0)
+        if fraction > 0.03 and elapsed_seconds > 2.0:
+            remaining = elapsed_seconds / fraction * (1.0 - fraction)
+            self.timer_var.set(
+                f"Laufzeit: {format_duration(elapsed_seconds, include_tenths=True)}  |  "
+                f"ETA: {format_duration(remaining, include_tenths=True)}"
+            )
+        else:
+            self._set_timer_text("Laufzeit", elapsed_seconds)
+
         status_suffix = " | Abbruch laeuft" if (self.processing_cancel_requested or self.animation_cancel_requested) else ""
-        self.status_var.set(f"{self.loading_message}{suffix}{status_suffix}")
+        short_msg = _truncate_middle(self.loading_message, 50)
+        self.status_var.set(f"{short_msg}{suffix}{status_suffix}")
         self.loading_tick += 1
         self.loading_job = self.after(160, self._animate_loading)
 
@@ -6414,13 +6960,14 @@ class ComparisonApp(tk.Tk):
             cancelled_count = len(self.cancelled_map)
             if self.processing_cancel_requested:
                 self.progress_var.set(
-                    f"Abbruch angefordert - {self.completed_files} / {self.total_files} abgeschlossen "
+                    f"Abbruch angefordert – {self.completed_files}/{self.total_files} "
                     f"({cancelled_count} abgebrochen)"
                 )
             else:
+                # Compact format: "Datei 3/12 – kurzname.abs (67%)"
+                short_name = _truncate_middle(self.loading_message, 40)
                 self.progress_var.set(
-                    f"{self.completed_files} / {self.total_files} Dateien fertig - "
-                    f"aktive Datei {current_display} bei {percent}%"
+                    f"Datei {current_display}/{self.total_files} – {short_name} ({percent}%)"
                 )
 
     def _finish_processing(self) -> None:
@@ -6461,18 +7008,16 @@ class ComparisonApp(tk.Tk):
         self.last_confirmed_speed = int(self.animation_speed_var.get())
         self.last_confirmed_trail = int(self.trail_count_var.get())
 
-        summary_lines = [
-            f"Gesamtzeit: {format_duration(self.processing_total_seconds, include_tenths=True)}",
-            f"Erfolgreich: {len(self.results)} | Fehler: {len(self.errors)} | Abgebrochen: {len(self.cancelled_files)}",
-        ]
-        summary_lines.extend(
-            f"{result.source_label}: {format_duration(result.processing_seconds, include_tenths=True)}"
-            for result in self.results
+        summary = (
+            f"Gesamtzeit: {format_duration(self.processing_total_seconds, include_tenths=True)}  |  "
+            f"Erfolgreich: {len(self.results)}  |  Fehler: {len(self.errors)}  |  Abgebrochen: {len(self.cancelled_files)}"
         )
-        self.status_var.set("Verarbeitung abgeschlossen. Bitte Ergebnis pruefen oder Viewer oeffnen.")
-        self.progress_var.set("\n".join(summary_lines))
+        if self.errors:
+            summary += f"  ⚠ {len(self.errors)} Fehler"
+        self.status_var.set("Verarbeitung abgeschlossen.")
+        self.progress_var.set(summary)
         self._load_result(0, start_playback=False)
-        self.status_var.set("Ergebnis geladen. Interaktiven Viewer bei Bedarf oeffnen.")
+        self.status_var.set("Ergebnis geladen. Viewer bei Bedarf oeffnen.")
 
     def _build_viewer_payload(self, selected_index: int) -> Dict[str, Any]:
         """Serialize the current results into a payload consumed by the standalone viewer."""
@@ -7232,7 +7777,7 @@ def run_self_tests() -> None:
     ) == "inner/01021_optimised_density_adaptive_sampling.B99"
     assert parse_b99_archive_entry_name("12021.B99") == (12, "infill")
     assert parse_b99_archive_entry_name("12031.B99") == (12, "boundary")
-    assert parse_b99_archive_entry_name("12091.B99") == (12, "combo")
+    assert parse_b99_archive_entry_name("12091.B99") == (12, "infill")  # Object 5 infill (digit 9)
     assert normalize_zip_entry_types(None) == ("infill",)
     assert normalize_zip_entry_types(("boundary", "infill", "boundary")) == ("boundary", "infill")
     assert set(select_bucket_candidates(list(range(10)), candidate_limit=4, randomized=False)) == {0, 1, 2, 3}
@@ -7495,16 +8040,19 @@ def run_self_tests() -> None:
             zip_support_end_layer=0,
         )
         assert not source_errors
-        assert len(input_sources) == 1
+        assert len(input_sources) == 2  # 01021 (digit 2) + 37091 (digit 9 = object 5 infill)
         assert input_sources[0].archive_member == "inner/01021.B99"
         assert input_sources[0].output_name == "inner/01021.B99"
+        assert input_sources[1].archive_member == "figure files/37091.B99"
         dual_sources, dual_errors = build_input_sources(
             [str(archive_input_path)],
             zip_entry_types=("infill", "boundary"),
             zip_support_end_layer=0,
         )
         assert not dual_errors
-        assert [source.archive_member for source in dual_sources] == ["inner/01021.B99", "inner/02031.B99"]
+        assert [source.archive_member for source in dual_sources] == [
+            "inner/01021.B99", "inner/02031.B99", "figure files/37091.B99",
+        ]
         assert build_output_name_for_source(input_sources[0], "stochastic_grid_dispersion") == (
             "inner/01021_optimised_stochastic_grid_dispersion.B99"
         )
@@ -7567,16 +8115,27 @@ def run_self_tests() -> None:
             untouched_member = archive.read("inner/02031.B99").decode("utf-8")
             assert optimized_member == processed_zip_result.output_text
             assert untouched_member == "ABS 2.0 2.0\nABS 3.0 3.0\n"
+        # Digit 9 is now infill (object 5) – combo type no longer produced
         combo_input_sources, combo_source_errors = build_input_sources(
             [str(archive_input_path)],
             zip_entry_types=("combo",),
             zip_support_end_layer=0,
         )
-        assert not combo_source_errors
-        assert len(combo_input_sources) == 1
-        assert combo_input_sources[0].archive_member == "figure files/37091.B99"
+        # No entries classify as combo anymore
+        assert combo_source_errors  # should report "no matching entries"
+        assert len(combo_input_sources) == 0
+
+        # Verify that 37091.B99 (digit 9) is now reachable via infill filter
+        figure_infill_sources, figure_infill_errors = build_input_sources(
+            [str(archive_input_path)],
+            zip_entry_types=("infill",),
+            zip_support_end_layer=36,  # skip layers <= 36 to isolate layer 37
+        )
+        assert not figure_infill_errors
+        assert len(figure_infill_sources) == 1
+        assert figure_infill_sources[0].archive_member == "figure files/37091.B99"
         processed_combo_result = process_file(
-            combo_input_sources[0],
+            figure_infill_sources[0],
             w1=W1_DEFAULT,
             w2=W2_DEFAULT,
             memory=MEMORY_DEFAULT,
