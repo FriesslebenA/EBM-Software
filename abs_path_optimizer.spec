@@ -12,6 +12,8 @@ def safe_collect(collector, package_name):
 
 hiddenimports = [
     "numpy",
+    "PIL",
+    "PIL.Image",
     "PySide6",
     "PySide6.QtCore",
     "PySide6.QtGui",

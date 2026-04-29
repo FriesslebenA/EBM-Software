@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch *)",
+      "Bash(git switch *)",
+      "Bash(git clone *)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import abs_path_optimizer as m; m.run_self_tests\\(\\); print\\('Alle Self-Tests bestanden.'\\)\")",
+      "Bash(python -m PyInstaller --clean --noconfirm abs_path_optimizer.spec)",
+      "Bash(where python *)",
+      "Bash(python -m pip show pyinstaller)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip show pyinstaller)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip show numpy)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/bin/python.exe\" --version)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/bin/python.exe\" -m pip show pyinstaller)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip install pyinstaller)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip show Pillow)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m PyInstaller --clean --noconfirm abs_path_optimizer.spec)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -c \"import PySide6; print\\(PySide6.__file__\\)\")",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip show PySide6)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -c \"import site; print\\('\\\\n'.join\\(site.getsitepackages\\(\\)\\)\\)\")",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip install PySide6)",
+      "Bash(\"/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe\" -m pip install numpy Pillow)",
+      "Bash(/c/Users/leonh/AppData/Local/Python/pythoncore-3.14-64/python.exe *)"
+    ]
+  }
+}

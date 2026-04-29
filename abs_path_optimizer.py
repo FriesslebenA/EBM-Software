@@ -77,6 +77,10 @@ MODE_PARAMETER_RECENT_PERCENT = "recent_percent"
 MODE_PARAMETER_GHOST_DELAY = "ghost_delay"
 MODE_PARAMETER_FORWARD_JUMP = "forward_jump"
 MODE_PARAMETER_BACKWARD_JUMP = "backward_jump"
+MODE_PARAMETER_HILBERT_ORDER = "hilbert_order"
+MODE_PARAMETER_SPOT_SKIP = "spot_skip"
+HILBERT_ORDER_DEFAULT = 4
+SPOT_SKIP_DEFAULT = 2
 ANIMATION_BASE_POINTS_PER_SECOND = 3.0
 ANIMATION_MIN_MULTIPLIER = 1
 ANIMATION_MAX_MULTIPLIER = 1000
@@ -226,6 +230,50 @@ MODE_SPECS: Dict[str, ModeSpec] = {
             "jump blocks to reduce immediately adjacent consecutive exposures without duplicating any point."
         ),
         visible_parameters=(MODE_PARAMETER_FORWARD_JUMP, MODE_PARAMETER_BACKWARD_JUMP),
+    ),
+    "raster_zigzag": ModeSpec(
+        canonical_id="raster_zigzag",
+        label="Raster Zig-Zag",
+        description=(
+            "This mode reorders points in a boustrophedon raster pattern by detecting the natural scan-line spacing "
+            "from the source point cloud and sorting alternating rows in opposite X directions. It serves as a "
+            "deterministic O(N log N) reference strategy for uniform area coverage without spatial dispersion."
+        ),
+        visible_parameters=(),
+    ),
+    "spot_ordered": ModeSpec(
+        canonical_id="spot_ordered",
+        label="Spot Ordered (Multipass)",
+        description=(
+            "This mode applies a raster pre-sort and then splits the sequence into interleaved passes separated by "
+            "a configurable skip distance. Adjacent spots in the original raster order are exposed in different "
+            "passes, introducing a controlled dwell interval between neighbouring melt events to reduce thermal "
+            "accumulation without sacrificing deterministic coverage."
+        ),
+        visible_parameters=(MODE_PARAMETER_SPOT_SKIP,),
+    ),
+    "hilbert_curve": ModeSpec(
+        canonical_id="hilbert_curve",
+        label="Hilbert Curve",
+        description=(
+            "This mode projects the point cloud onto a two-dimensional Hilbert space-filling curve and visits "
+            "points in the resulting index order. The Hilbert mapping maximises spatial locality and cache "
+            "coherence while providing a deterministic, reproducible traversal that covers the build area "
+            "uniformly at progressively finer scales. The grid resolution is controlled by the order parameter."
+        ),
+        visible_parameters=(MODE_PARAMETER_HILBERT_ORDER,),
+    ),
+    "island_raster": ModeSpec(
+        canonical_id="island_raster",
+        label="Island Raster (Chessboard)",
+        description=(
+            "This mode partitions the point cloud into a chessboard of square islands and processes them in two "
+            "alternating phases: phase-A islands (even diagonal index) are completed before phase-B islands "
+            "(odd diagonal index), mimicking the thermal isolation strategy used in industrial island scanning. "
+            "Within each island the points are sorted in boustrophedon raster order. The island edge length is "
+            "set by the grid spacing parameter."
+        ),
+        visible_parameters=(MODE_PARAMETER_GRID_SPACING,),
     ),
 }
 MODE_ALIASES = {
@@ -969,14 +1017,17 @@ def _collect_farthest_candidate_ids(
     active_ids: Set[int],
     target_candidates: int,
 ) -> List[int]:
-    """Collect a set of far-away candidates from the remaining points."""
+    """Collect a set of far-away candidates from the remaining points using numpy argpartition."""
     if len(active_ids) <= target_candidates:
         return list(active_ids)
-
-    return sorted(
-        active_ids,
-        key=lambda point_id: (-dist(points[point_id], current), point_id),
-    )[:target_candidates]
+    import numpy as np
+    active_list = list(active_ids)
+    pts = np.array([points[i] for i in active_list], dtype=np.float64)
+    cur = np.array(current, dtype=np.float64)
+    dists = np.sqrt(np.sum((pts - cur) ** 2, axis=1))
+    k = min(target_candidates, len(active_list))
+    top_k = np.argpartition(dists, -k)[-k:]
+    return [active_list[int(i)] for i in top_k]
 
 
 def _cell_center(cell_key: Tuple[int, int], min_x: float, min_y: float, cell_size: float) -> Point:
@@ -1202,6 +1253,112 @@ def reorder_ghost_beam_stripe_indices(
     return reordered_indices
 
 
+def _xy2d_hilbert(n: int, x: int, y: int) -> int:
+    """Convert (x, y) grid coordinates to a Hilbert curve index for an n×n grid."""
+    d = 0
+    s = n >> 1
+    while s > 0:
+        rx = 1 if (x & s) > 0 else 0
+        ry = 1 if (y & s) > 0 else 0
+        d += s * s * ((3 * rx) ^ ry)
+        if ry == 0:
+            if rx == 1:
+                x = s - 1 - x
+                y = s - 1 - y
+            x, y = y, x
+        s >>= 1
+    return d
+
+
+def _raster_zigzag_indices(points: Sequence[Point]) -> List[int]:
+    """Return point indices sorted in boustrophedon raster order."""
+    import numpy as np
+    if not points:
+        return []
+    if len(points) == 1:
+        return [0]
+    pts = np.array(points, dtype=np.float64)
+    ys = pts[:, 1]
+    unique_ys = np.unique(np.round(ys, 9))
+    if len(unique_ys) < 2:
+        return np.argsort(pts[:, 0]).tolist()
+    resolution = float(np.min(np.diff(unique_ys))) * 0.5
+    y_rounded = np.round(ys / resolution) * resolution
+    unique_y_rounded = np.unique(y_rounded)
+    result: List[int] = []
+    for row_index, yc in enumerate(unique_y_rounded):
+        mask = np.abs(y_rounded - yc) < resolution * 0.1
+        row_indices = np.where(mask)[0]
+        order = row_indices[np.argsort(pts[row_indices, 0])]
+        if row_index % 2 == 1:
+            order = order[::-1]
+        result.extend(order.tolist())
+    return result
+
+
+def _optimize_raster_zigzag(points: List[Point]) -> List[Point]:
+    """Reorder points in boustrophedon raster order using the natural scan-line grid."""
+    return [points[i] for i in _raster_zigzag_indices(points)]
+
+
+def _optimize_spot_ordered(points: List[Point], spot_skip: int) -> List[Point]:
+    """Raster pre-sort followed by interleaved multipass splitting for controlled cooling."""
+    base_indices = _raster_zigzag_indices(points)
+    safe_skip = max(1, int(spot_skip))
+    passes = [base_indices[offset :: safe_skip + 1] for offset in range(safe_skip + 1)]
+    result: List[int] = []
+    for p in passes:
+        result.extend(p)
+    return [points[i] for i in result]
+
+
+def _optimize_hilbert_curve(points: List[Point], order: int) -> List[Point]:
+    """Reorder points along a Hilbert space-filling curve of the given order."""
+    import numpy as np
+    if len(points) < 2:
+        return list(points)
+    n = 2 ** max(1, min(int(order), 7))
+    pts = np.array(points, dtype=np.float64)
+    min_x, max_x = float(pts[:, 0].min()), float(pts[:, 0].max())
+    min_y, max_y = float(pts[:, 1].min()), float(pts[:, 1].max())
+    eps = 1e-12
+    ix = np.clip(((pts[:, 0] - min_x) / (max_x - min_x + eps) * (n - 1)).astype(int), 0, n - 1)
+    iy = np.clip(((pts[:, 1] - min_y) / (max_y - min_y + eps) * (n - 1)).astype(int), 0, n - 1)
+    h_indices = [_xy2d_hilbert(n, int(x), int(y)) for x, y in zip(ix.tolist(), iy.tolist())]
+    return [points[i] for i in np.argsort(h_indices).tolist()]
+
+
+def _optimize_island_raster(points: List[Point], island_size: float) -> List[Point]:
+    """Chessboard island segmentation with boustrophedon raster sort within each island."""
+    import numpy as np
+    if len(points) < 2:
+        return list(points)
+    safe_size = max(float(island_size), 1e-9)
+    pts = np.array(points, dtype=np.float64)
+    min_x, min_y = float(pts[:, 0].min()), float(pts[:, 1].min())
+    col_idx = ((pts[:, 0] - min_x) / safe_size).astype(int)
+    row_idx = ((pts[:, 1] - min_y) / safe_size).astype(int)
+    result: List[int] = []
+    for phase in (0, 1):
+        phase_point_ids = np.where(((row_idx + col_idx) % 2) == phase)[0].tolist()
+        if not phase_point_ids:
+            continue
+        cells: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        for pid in phase_point_ids:
+            cells[(int(row_idx[pid]), int(col_idx[pid]))].append(pid)
+        rows_present = sorted({r for r, _c in cells})
+        for row in rows_present:
+            cols = sorted(c for r, c in cells if r == row)
+            if row % 2 == 1:
+                cols = cols[::-1]
+            for col in cols:
+                orig_ids = cells[(row, col)]
+                cell_pts = [points[i] for i in orig_ids]
+                local_order = _raster_zigzag_indices(cell_pts)
+                result.extend(orig_ids[local_i] for local_i in local_order)
+    return [points[i] for i in result]
+
+
 def optimize_path(
     points: List[Point],
     w1: float = W1_DEFAULT,
@@ -1215,6 +1372,8 @@ def optimize_path(
     ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
     forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
     backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
+    hilbert_order: int = HILBERT_ORDER_DEFAULT,
+    spot_skip: int = SPOT_SKIP_DEFAULT,
     cancel_event: object = None,
 ) -> List[Point]:
     """Optimize point order with the selected strategy."""
@@ -1308,6 +1467,38 @@ def optimize_path(
                 )
 
         return [points[point_id] for point_id in optimized_indices]
+
+    if normalized_mode == "raster_zigzag":
+        if progress_callback is not None:
+            progress_callback(0.5, f"{len(points)} Punkte werden sortiert")
+        result = _optimize_raster_zigzag(points)
+        if progress_callback is not None:
+            progress_callback(1.0, f"{len(result)} / {len(result)} Punkte mit {get_mode_label(normalized_mode)} sortiert")
+        return result
+
+    if normalized_mode == "spot_ordered":
+        if progress_callback is not None:
+            progress_callback(0.5, f"{len(points)} Punkte werden sortiert")
+        result = _optimize_spot_ordered(points, spot_skip)
+        if progress_callback is not None:
+            progress_callback(1.0, f"{len(result)} / {len(result)} Punkte mit {get_mode_label(normalized_mode)} sortiert")
+        return result
+
+    if normalized_mode == "hilbert_curve":
+        if progress_callback is not None:
+            progress_callback(0.5, f"{len(points)} Punkte werden auf Hilbert-Kurve projiziert")
+        result = _optimize_hilbert_curve(points, hilbert_order)
+        if progress_callback is not None:
+            progress_callback(1.0, f"{len(result)} / {len(result)} Punkte mit {get_mode_label(normalized_mode)} sortiert")
+        return result
+
+    if normalized_mode == "island_raster":
+        if progress_callback is not None:
+            progress_callback(0.5, f"{len(points)} Punkte werden in Inseln segmentiert")
+        result = _optimize_island_raster(points, grid_spacing)
+        if progress_callback is not None:
+            progress_callback(1.0, f"{len(result)} / {len(result)} Punkte mit {get_mode_label(normalized_mode)} sortiert")
+        return result
 
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
@@ -1489,11 +1680,13 @@ def optimize_path(
     register_point(0)
     report_progress(f"{len(optimized_ids)} / {total_steps} Punkte optimiert")
 
+    import numpy as _np_opt
+
     while active_ids:
         raise_if_cancelled(cancel_event)
         current_id = optimized_ids[-1]
         current = points[current_id]
-        recent_points = [points[point_id] for point_id in optimized_ids[-memory:]] if memory > 0 else []
+        recent_ids_slice = optimized_ids[-memory:] if memory > 0 else []
         target_candidates = min(max(96, memory * 24), len(active_ids))
 
         if normalized_mode == "local_greedy":
@@ -1507,10 +1700,6 @@ def optimize_path(
                 cell_size=cell_size,
                 target_candidates=target_candidates,
             )
-            best_id = min(
-                candidate_ids,
-                key=lambda point_id: _score_candidate(points[point_id], current, recent_points, w1, w2),
-            )
         else:
             candidate_ids = _collect_farthest_candidate_ids(
                 current=current,
@@ -1518,10 +1707,24 @@ def optimize_path(
                 active_ids=active_ids,
                 target_candidates=target_candidates,
             )
-            best_id = max(
-                candidate_ids,
-                key=lambda point_id: _spread_score_candidate(points[point_id], current, recent_points, w1, w2),
-            )
+
+        cand_pts = _np_opt.array([points[pid] for pid in candidate_ids], dtype=_np_opt.float64)
+        cur_arr = _np_opt.array(current, dtype=_np_opt.float64)
+        dist_to_current = _np_opt.sqrt(_np_opt.sum((cand_pts - cur_arr) ** 2, axis=1))
+        scores = w1 * dist_to_current
+        if recent_ids_slice and w2 > 0.0:
+            for rid in recent_ids_slice:
+                rec = _np_opt.array(points[rid], dtype=_np_opt.float64)
+                rep = _np_opt.sqrt(_np_opt.sum((cand_pts - rec) ** 2, axis=1))
+                if normalized_mode == "local_greedy":
+                    scores -= w2 * rep
+                else:
+                    scores += w2 * rep
+
+        if normalized_mode == "local_greedy":
+            best_id = candidate_ids[int(_np_opt.argmin(scores))]
+        else:
+            best_id = candidate_ids[int(_np_opt.argmax(scores))]
 
         register_point(best_id)
         report_progress(f"{len(optimized_ids)} / {total_steps} Punkte optimiert")
@@ -1602,6 +1805,8 @@ def process_file(
     ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
     forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
     backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
+    hilbert_order: int = HILBERT_ORDER_DEFAULT,
+    spot_skip: int = SPOT_SKIP_DEFAULT,
     cancel_event: object = None,
 ) -> ProcessedFileResult:
     """Load, optimize and analyze one ABS file."""
@@ -1636,6 +1841,8 @@ def process_file(
         ghost_delay=ghost_delay,
         forward_jump=forward_jump,
         backward_jump=backward_jump,
+        hilbert_order=hilbert_order,
+        spot_skip=spot_skip,
         cancel_event=cancel_event,
     )
     raise_if_cancelled(cancel_event)
@@ -1676,6 +1883,8 @@ def process_files(
     ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
     forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
     backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
+    hilbert_order: int = HILBERT_ORDER_DEFAULT,
+    spot_skip: int = SPOT_SKIP_DEFAULT,
 ) -> Tuple[List[ProcessedFileResult], List[str]]:
     """Process all selected files and collect readable errors."""
     results: List[ProcessedFileResult] = []
@@ -1695,6 +1904,8 @@ def process_files(
                 ghost_delay=ghost_delay,
                 forward_jump=forward_jump,
                 backward_jump=backward_jump,
+                hilbert_order=hilbert_order,
+                spot_skip=spot_skip,
             )
         except Exception as exc:
             source_label = normalize_input_source(input_source).source_label
@@ -2113,6 +2324,8 @@ def ask_for_optimization_settings(
     current_ghost_delay: int,
     current_forward_jump: int,
     current_backward_jump: int,
+    current_hilbert_order: int = HILBERT_ORDER_DEFAULT,
+    current_spot_skip: int = SPOT_SKIP_DEFAULT,
 ) -> Optional[Dict[str, object]]:
     """Ask for the processing mode and its mode-specific parameters."""
     dialog = tk.Toplevel(parent)
@@ -2130,6 +2343,8 @@ def ask_for_optimization_settings(
     ghost_delay_var = tk.StringVar(value=str(current_ghost_delay))
     forward_jump_var = tk.StringVar(value=str(current_forward_jump))
     backward_jump_var = tk.StringVar(value=str(current_backward_jump))
+    hilbert_order_var = tk.StringVar(value=str(current_hilbert_order))
+    spot_skip_var = tk.StringVar(value=str(current_spot_skip))
     help_var = tk.StringVar()
     parameter_hint_var = tk.StringVar()
     mode_labels = [MODE_SPECS[mode_id].label for mode_id in OPTIMIZATION_MODES]
@@ -2203,6 +2418,24 @@ def ask_for_optimization_settings(
         width=12,
         font=("Segoe UI", 10),
     )
+    hilbert_order_label = tk.Label(form, text="Hilbert order (2–7)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    hilbert_order_spin = tk.Spinbox(
+        form,
+        from_=2,
+        to=7,
+        textvariable=hilbert_order_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
+    spot_skip_label = tk.Label(form, text="Spot skip (passes−1)", bg="#1a1a1a", fg="#f0f0f0", font=("Segoe UI", 10))
+    spot_skip_spin = tk.Spinbox(
+        form,
+        from_=1,
+        to=20,
+        textvariable=spot_skip_var,
+        width=12,
+        font=("Segoe UI", 10),
+    )
 
     age_decay_label = tk.Label(
         form,
@@ -2270,15 +2503,21 @@ def ask_for_optimization_settings(
     )
     backward_jump_spin.grid(row=6, column=1, sticky="w", pady=4)
 
+    hilbert_order_label.grid(row=7, column=0, sticky="w", pady=4)
+    hilbert_order_spin.grid(row=7, column=1, sticky="w", pady=4)
+
+    spot_skip_label.grid(row=8, column=0, sticky="w", pady=4)
+    spot_skip_spin.grid(row=8, column=1, sticky="w", pady=4)
+
     age_decay_label.grid(
-        row=7,
+        row=9,
         column=0,
         columnspan=2,
         sticky="w",
         pady=(8, 0),
     )
     parameter_hint_label.grid(
-        row=8,
+        row=10,
         column=0,
         columnspan=2,
         sticky="w",
@@ -2340,6 +2579,18 @@ def ask_for_optimization_settings(
             else:
                 widget.grid_remove()
 
+        for widget in (hilbert_order_label, hilbert_order_spin):
+            if MODE_PARAMETER_HILBERT_ORDER in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        for widget in (spot_skip_label, spot_skip_spin):
+            if MODE_PARAMETER_SPOT_SKIP in visible_parameters:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
         if MODE_PARAMETER_GRID_SPACING in visible_parameters:
             age_decay_label.grid()
         else:
@@ -2370,6 +2621,8 @@ def ask_for_optimization_settings(
         ghost_delay_value = current_ghost_delay
         forward_jump_value = current_forward_jump
         backward_jump_value = current_backward_jump
+        hilbert_order_value = current_hilbert_order
+        spot_skip_value = current_spot_skip
 
         if MODE_PARAMETER_MEMORY in visible_parameters:
             try:
@@ -2433,6 +2686,26 @@ def ask_for_optimization_settings(
                 messagebox.showerror("Pfadberechnung", "Backward jump muss mindestens 1 sein.", parent=dialog)
                 return
 
+        if MODE_PARAMETER_HILBERT_ORDER in visible_parameters:
+            try:
+                hilbert_order_value = int(hilbert_order_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte fuer Hilbert order eine ganze Zahl eingeben.", parent=dialog)
+                return
+            if not 2 <= hilbert_order_value <= 7:
+                messagebox.showerror("Pfadberechnung", "Hilbert order muss zwischen 2 und 7 liegen.", parent=dialog)
+                return
+
+        if MODE_PARAMETER_SPOT_SKIP in visible_parameters:
+            try:
+                spot_skip_value = int(spot_skip_var.get())
+            except ValueError:
+                messagebox.showerror("Pfadberechnung", "Bitte fuer Spot skip eine ganze Zahl eingeben.", parent=dialog)
+                return
+            if not 1 <= spot_skip_value <= 20:
+                messagebox.showerror("Pfadberechnung", "Spot skip muss zwischen 1 und 20 liegen.", parent=dialog)
+                return
+
         result["value"] = {
             "mode": spec.canonical_id,
             "memory": memory_value,
@@ -2442,6 +2715,8 @@ def ask_for_optimization_settings(
             "ghost_delay": ghost_delay_value,
             "forward_jump": forward_jump_value,
             "backward_jump": backward_jump_value,
+            "hilbert_order": hilbert_order_value,
+            "spot_skip": spot_skip_value,
         }
         dialog.destroy()
 
@@ -4802,6 +5077,8 @@ def process_file_in_subprocess(
     ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
     forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
     backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
+    hilbert_order: int = HILBERT_ORDER_DEFAULT,
+    spot_skip: int = SPOT_SKIP_DEFAULT,
     cancel_event: object = None,
 ) -> Tuple[int, int, str, ProcessedFileResult]:
     """Process one file in a separate process and forward progress messages."""
@@ -4825,6 +5102,8 @@ def process_file_in_subprocess(
         ghost_delay=ghost_delay,
         forward_jump=forward_jump,
         backward_jump=backward_jump,
+        hilbert_order=hilbert_order,
+        spot_skip=spot_skip,
         cancel_event=cancel_event,
     )
     return (file_index, total_files, file_name, result)
@@ -4869,6 +5148,8 @@ class ComparisonApp(tk.Tk):
         ghost_delay: int = GHOST_BEAM_DEFAULT_DELAY,
         forward_jump: int = INTERLACED_STRIPE_DEFAULT_FORWARD_JUMP,
         backward_jump: int = INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
+        hilbert_order: int = HILBERT_ORDER_DEFAULT,
+        spot_skip: int = SPOT_SKIP_DEFAULT,
     ):
         super().__init__()
         self.w1 = w1
@@ -4881,6 +5162,8 @@ class ComparisonApp(tk.Tk):
         self.ghost_delay = int(ghost_delay)
         self.forward_jump = int(forward_jump)
         self.backward_jump = int(backward_jump)
+        self.hilbert_order = int(hilbert_order)
+        self.spot_skip = int(spot_skip)
         self.zip_entry_types = ("infill",)
         self.zip_support_end_layer = 0
         self.step_point_spacing_mm = STEP_POINT_SPACING_MM_DEFAULT
@@ -5689,6 +5972,8 @@ class ComparisonApp(tk.Tk):
             current_ghost_delay=self.ghost_delay,
             current_forward_jump=self.forward_jump,
             current_backward_jump=self.backward_jump,
+            current_hilbert_order=self.hilbert_order,
+            current_spot_skip=self.spot_skip,
         )
         if settings is None:
             self.status_var.set("Dateiauswahl abgebrochen. Keine Verarbeitung gestartet.")
@@ -5703,6 +5988,8 @@ class ComparisonApp(tk.Tk):
         self.ghost_delay = int(settings["ghost_delay"])
         self.forward_jump = int(settings["forward_jump"])
         self.backward_jump = int(settings["backward_jump"])
+        self.hilbert_order = int(settings.get("hilbert_order", HILBERT_ORDER_DEFAULT))
+        self.spot_skip = int(settings.get("spot_skip", SPOT_SKIP_DEFAULT))
 
         plain_files = [file_path for file_path in selected_files if Path(file_path).suffix.lower() not in {".zip", ".step", ".stp"}]
         zip_files = [file_path for file_path in selected_files if Path(file_path).suffix.lower() == ".zip"]
@@ -5953,6 +6240,8 @@ class ComparisonApp(tk.Tk):
                 self.ghost_delay,
                 self.forward_jump,
                 self.backward_jump,
+                self.hilbert_order,
+                self.spot_skip,
                 self.process_cancel_event,
             )
             future.add_done_callback(
@@ -6612,26 +6901,35 @@ class ComparisonApp(tk.Tk):
 
     def _reset_canvas_raster(self, canvas: tk.Canvas) -> None:
         """Reset one canvas to the base image with all points as dark background dots."""
-        photo: Optional[tk.PhotoImage] = getattr(canvas, "render_photo", None)
+        import numpy as np
+        import base64
+        import io
+        from PIL import Image
+
         cached_points: List[Tuple[int, int]] = getattr(canvas, "cached_points", [])
         width = getattr(canvas, "cached_width", 0)
         height = getattr(canvas, "cached_height", 0)
+        image_item = getattr(canvas, "image_item", None)
 
-        if photo is None or width <= 0 or height <= 0:
+        if image_item is None or width <= 0 or height <= 0:
             return
 
-        photo.blank()
-        photo.put("#000000", to=(0, 0, width, height))
+        arr = np.zeros((height, width, 3), dtype=np.uint8)
+        half = BACKGROUND_POINT_HALF_SIZE
+        dim = 0x1b
         for x_pos, y_pos in cached_points:
-            self._put_photo_square(
-                photo,
-                x_pos,
-                y_pos,
-                "#1b1b1b",
-                BACKGROUND_POINT_HALF_SIZE,
-                width,
-                height,
-            )
+            x0 = max(0, x_pos - half)
+            x1 = min(width, x_pos + half + 1)
+            y0 = max(0, y_pos - half)
+            y1 = min(height, y_pos + half + 1)
+            arr[y0:y1, x0:x1] = dim
+
+        buf = io.BytesIO()
+        Image.fromarray(arr, "RGB").save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue())
+        new_photo = tk.PhotoImage(data=b64)
+        canvas.render_photo = new_photo
+        canvas.itemconfigure(image_item, image=new_photo)
 
         canvas.last_base_index = -1
         canvas.last_gray_limit = -1
@@ -7138,6 +7436,28 @@ def run_self_tests() -> None:
     assert len(random_noise_result) == len(grid_spread_points)
     assert sorted(random_noise_result) == sorted(grid_spread_points)
 
+    raster_points = [
+        (0.0, 0.0), (1.0, 0.0), (2.0, 0.0),
+        (0.0, 1.0), (1.0, 1.0), (2.0, 1.0),
+        (0.0, 2.0), (1.0, 2.0), (2.0, 2.0),
+    ]
+    zigzag_result = optimize_path(raster_points, mode="raster_zigzag")
+    assert sorted(zigzag_result) == sorted(raster_points)
+    assert len(zigzag_result) == len(raster_points)
+    assert zigzag_result[0][1] == zigzag_result[1][1]
+
+    hilbert_result = optimize_path(raster_points, mode="hilbert_curve", hilbert_order=3)
+    assert sorted(hilbert_result) == sorted(raster_points)
+    assert len(hilbert_result) == len(raster_points)
+
+    spot_result = optimize_path(raster_points, mode="spot_ordered", spot_skip=2)
+    assert sorted(spot_result) == sorted(raster_points)
+    assert len(spot_result) == len(raster_points)
+
+    island_result = optimize_path(raster_points, mode="island_raster", grid_spacing=1.5)
+    assert sorted(island_result) == sorted(raster_points)
+    assert len(island_result) == len(raster_points)
+
     test_root = Path(__file__).resolve().parent
     input_path = test_root / "_selftest_sample_abs.txt"
     archive_input_path = test_root / "_selftest_archive.zip"
@@ -7345,6 +7665,18 @@ def main() -> None:
         default=INTERLACED_STRIPE_DEFAULT_BACKWARD_JUMP,
         help="Rueckwaertssprung-Anteil fuer die Blockgroesse bei Interlaced Stripe Scanning.",
     )
+    parser.add_argument(
+        "--hilbert-order",
+        type=int,
+        default=HILBERT_ORDER_DEFAULT,
+        help="Ordnung der Hilbert-Kurve (2–7). Nur fuer hilbert_curve-Modus.",
+    )
+    parser.add_argument(
+        "--spot-skip",
+        type=int,
+        default=SPOT_SKIP_DEFAULT,
+        help="Anzahl uebersprungener Punkte zwischen Paessen fuer spot_ordered-Modus (1–20).",
+    )
     args = parser.parse_args()
 
     if args.viewer_payload:
@@ -7369,6 +7701,8 @@ def main() -> None:
             ghost_delay=args.ghost_delay,
             forward_jump=args.forward_jump,
             backward_jump=args.backward_jump,
+            hilbert_order=args.hilbert_order,
+            spot_skip=args.spot_skip,
         )
         app.mainloop()
     except tk.TclError as exc:
