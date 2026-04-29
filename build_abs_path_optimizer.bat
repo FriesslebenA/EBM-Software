@@ -31,15 +31,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "dist\SequenceOptimiser.exe" if exist "dist\StepLayerGenerator.exe" (
+if exist "dist\SequenceOptimiser\SequenceOptimiser.exe" if exist "dist\StepLayerGenerator.exe" (
     echo.
     echo Erzeuge ZIP-Paket...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\\SequenceOptimiser.exe','dist\\StepLayerGenerator.exe' -DestinationPath 'dist\\SequenceOptimiser_portable.zip' -Force"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\\SequenceOptimiser','dist\\StepLayerGenerator.exe' -DestinationPath 'dist\\SequenceOptimiser_portable.zip' -Force"
 )
 
 echo.
 echo Fertig.
-echo EXE: dist\SequenceOptimiser.exe
+echo EXE-Ordner: dist\SequenceOptimiser
 if exist "dist\StepLayerGenerator.exe" echo STEP-Helper: dist\StepLayerGenerator.exe
 if exist "dist\SequenceOptimiser_portable.zip" echo ZIP: dist\SequenceOptimiser_portable.zip
 echo.
